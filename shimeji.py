@@ -102,6 +102,16 @@ ANIM: dict[str, list[tuple[str, int]]] = {
         ("clone_a.png", 5), ("clone_b.png", 2), ("clone_c.png", 2),
         ("clone_d.png", 5), ("clone_e.png", 20),
     ],
+    "clone2": [
+        ("breed_a.png", 5), ("breed_b.png", 2), ("breed_c.png", 2),
+        ("breed_d.png", 20)
+    ],
+
+    # Crawl
+    "sprawl": [("sprawl", 1)],
+    "crawl": [
+        ("crawl", 10), ("sprawl", 10)
+    ]
 }
 
 # ── States ────────────────────────────────────────────────────────────────────
@@ -127,6 +137,8 @@ class State(Enum):
     SIT_SPINHEAD = auto()
     SIT_LEDGE    = auto()
     WIN_CLIMB    = auto()
+    SPRAWL       = auto()
+    CRAWL        = auto()
 
 # ── Window info ───────────────────────────────────────────────────────────────
 
@@ -161,6 +173,7 @@ class Environment:
             self._xd   = xdsp.Display()
             self._root = self._xd.screen().root
             self._atom_cl         = self._xd.intern_atom("_NET_CLIENT_LIST")
+            self._atom_cls        = self._xd.intern_atom("_NET_CLIENT_LIST_STACKING")
             self._atom_fe         = self._xd.intern_atom("_NET_FRAME_EXTENTS")
             self._atom_mr         = self._xd.intern_atom("_NET_MOVERESIZE_WINDOW")
             self._atom_ws         = self._xd.intern_atom("_NET_WM_STATE")
@@ -185,41 +198,50 @@ class Environment:
         if not self._xd:
             return
         try:
-            prop = self._root.get_full_property(
-                self._atom_cl, self._X.AnyPropertyType
-            )
-            if not prop:
-                return
-            wins = []
             root_geom = self._root.get_geometry()
-            # Resolve current desktop index for workspace filtering
             cd_prop = self._root.get_full_property(
                 self._atom_cd, self._X.AnyPropertyType
             )
             current_desktop = int(cd_prop.value[0]) if (cd_prop and cd_prop.value) else -1
 
-            for wid in prop.value:
+            # Use stacking order (bottom → top) so we can detect occlusion.
+            # Fall back to mapping order if the atom is unsupported.
+            stk_prop = self._root.get_full_property(
+                self._atom_cls, self._X.AnyPropertyType
+            ) or self._root.get_full_property(
+                self._atom_cl, self._X.AnyPropertyType
+            )
+            if not stk_prop:
+                return
+            stacked_wids = [int(w) for w in stk_prop.value]
+
+            # Single pass: collect valid window info in stacking order and track
+            # the highest index occupied by a fullscreen window.
+            # stacked_wids[0] is the bottommost window, stacked_wids[-1] is topmost.
+            top_fs_idx  = -1
+            candidates  = []   # (stack_idx, WindowInfo)
+
+            for idx, wid in enumerate(stacked_wids):
                 if wid in self._own_wids:
                     continue
                 try:
                     w = self._xd.create_resource_object("window", wid)
 
-                    # Skip unmapped / iconified windows
                     attrs = w.get_attributes()
                     if attrs.map_state != self._X.IsViewable:
                         continue
 
-                    # Skip minimized or fullscreen windows via _NET_WM_STATE
                     ws_prop = w.get_full_property(
                         self._atom_ws, self._X.AnyPropertyType
                     )
-                    if ws_prop and ws_prop.value:
-                        states = set(ws_prop.value)
-                        if self._atom_hidden in states or self._atom_fullscreen in states:
-                            continue
+                    states = set(ws_prop.value) if (ws_prop and ws_prop.value) else set()
 
-                    # Skip windows on a different virtual desktop.
-                    # 0xFFFFFFFF means sticky (visible on all desktops).
+                    if self._atom_fullscreen in states:
+                        top_fs_idx = idx
+                        continue
+                    if self._atom_hidden in states:
+                        continue
+
                     if current_desktop >= 0:
                         try:
                             wd_prop = w.get_full_property(
@@ -232,23 +254,16 @@ class Environment:
                         except Exception:
                             pass
 
-                    # translate_coords gives the client window's top-left in root
-                    # coordinates — this is the visible position for both CSD apps
-                    # (where the title bar is drawn inside the client) and SSD apps
-                    # (close enough; avoids negative coords from shadow-inflated frames).
                     geom = w.get_geometry()
                     tr   = w.translate_coords(self._root, 0, 0)
                     rect = QRect(tr.x, tr.y, geom.width, geom.height)
                     if rect.width() <= 80 or rect.height() <= 80:
                         continue
-                    # Drop windows clearly off-screen (other virtual desktops,
-                    # invisible helper windows) — allow 64px margin for shadows.
                     if (rect.right() < -64 or rect.bottom() < -64
                             or rect.left() > root_geom.width + 64
                             or rect.top() > root_geom.height + 64):
                         continue
 
-                    # Window title: prefer _NET_WM_NAME (UTF-8), fall back to WM_NAME
                     name = ""
                     try:
                         np = w.get_full_property(
@@ -267,10 +282,13 @@ class Environment:
                         except Exception:
                             pass
 
-                    wins.append(WindowInfo(int(wid), rect, name))
+                    candidates.append((idx, WindowInfo(wid, rect, name)))
                 except Exception:
                     pass
-            self._windows = wins
+
+            # Discard any window that sits below (or at) the topmost fullscreen
+            # window — those are fully occluded and should be off-limits.
+            self._windows = [wi for idx, wi in candidates if idx > top_fs_idx]
             self._xd.flush()
         except Exception:
             pass
@@ -573,12 +591,13 @@ class Mascot(QWidget):
 
         elif state == State.WALL_CLING:
             self._anim.play(ANIM["wall_cling"])
-            self._state_ticks = random.randint(100,500)
+            self._state_ticks = random.randint(100,300)
             self._vx = 0.0; self._vy = 0.0
             self._ax = self._wall_left_x() if self._wall_side == "L" else self._wall_right_x()
 
         elif state == State.WALL_CLIMB:
             self._anim.play(ANIM["wall_climb"])
+            self._state_ticks = random.randint(200,500)
             self._vx = 0.0
             self._ax = self._wall_left_x() if self._wall_side == "L" else self._wall_right_x()
 
@@ -626,12 +645,29 @@ class Mascot(QWidget):
             self._vx = 0.0; self._vy = 0.0
 
         elif state == State.CLONING:
-            self._anim.play(ANIM["clone"])
+            self._anim.play(ANIM["clone"] if random.random() < 0.9 else ANIM["clone2"])
             self._vx = 0.0; self._vy = 0.0
 
         elif state == State.MERGING:
             self._anim.play(ANIM["clone"])
             self._vx = 0.0; self._vy = 0.0
+
+        elif state == State.SPRAWL:
+            self._anim.play(ANIM["sprawl"])
+            self._vx = 0.0; self._vy = 0.0
+
+        elif state == State.CRAWL:
+            self._anim.play(ANIM["crawl"])
+            self.uni_tick()
+            near_L = self._ax < self._screen.left()  + self._sw * 2
+            near_R = self._ax > self._screen.right() - self._sw * 2
+            if   near_L and not near_R: self._facing_right = True
+            elif near_R and not near_L: self._facing_right = False
+            else:                       self._facing_right = random.choice([True, False])
+            self._vx = WALK_SPEED if self._facing_right else -WALK_SPEED
+            self._vx *= 0.25
+            self._vy = 0.0
+
 
     # ── Main tick ─────────────────────────────────────────────────────────────
 
@@ -668,9 +704,13 @@ class Mascot(QWidget):
                 if self._state_ticks <= 0:
                     self._idle_transition()
                 elif random.random() < 0.002:
-                    self._try_jump()
+                    if random.random() < 0.5:
+                        self._try_jump()
+                    else:
+                        self._try_win_climb()
 
-        elif self._state == State.WALK or self._state == State.RUN:
+
+        elif self._state == State.WALK or self._state == State.RUN or self._state == State.CRAWL:
             self._ax += self._vx
             near_L = self._ax <= self._left_x()
             near_R = self._ax >= self._right_x()
@@ -684,8 +724,9 @@ class Mascot(QWidget):
                     self._enter(State.WALL_CLING)
                 else:
                     self._facing_right = not near_L
-                    self._vx = WALK_SPEED if self._facing_right else -WALK_SPEED
-                    self._vx *= 4 if self._state == State.RUN else 1
+                    mods = {State.WALK:1, State.RUN:2, State.CRAWL:0.25}
+                    speed = WALK_SPEED * mods[self._state]
+                    self._vx = speed if self._facing_right else -speed
 
             self._anim.advance()
             # Fall if walked off a window edge
@@ -695,14 +736,17 @@ class Mascot(QWidget):
                 self._state_ticks -= 1
                 if self._state_ticks <= 0:
                     self._enter(random.choices(
-                        [State.IDLE, State.SIT, State.WALK],
-                        weights=[40, 35, 25],
+                        [State.IDLE, State.SIT, State.WALK, State.SPRAWL],
+                        weights=[40, 35, 25, 2],
                     )[0])
                 # Occasionally grab a nearby window or jump to a surface
                 if Mascot._win_throw_on and self._carry_win is None:
                     self._maybe_grab_window()
                 if random.random() < 0.001:
-                    self._try_jump()
+                    if random.random():
+                        self._try_jump()
+                    else:
+                        self._try_win_climb()
 
         elif self._state == State.FALL:
             self._vy = min(self._vy + GRAVITY, MAX_FALL_SPD)
@@ -717,7 +761,20 @@ class Mascot(QWidget):
             self._vy  = min(self._vy + GRAVITY, MAX_FALL_SPD)
             self._ax += self._vx
             self._ay += self._vy
-            self._clamp_x()
+            # self._clamp_x()
+
+            # throw to the wall
+            if self._ax < self._left_x():
+                self._ax = self._left_x()
+                self._wall_side      = "L"
+                self._enter(State.WALL_CLING)
+
+            elif self._ax > self._right_x():
+                self._ax = self._right_x()
+                self._wall_side      = "R"
+                self._enter(State.WALL_CLING)
+
+            
             # Ceiling bounce
             if self._on_ceiling():
                 self._ay = float(self._screen.top()) + self._anc_y
@@ -779,7 +836,14 @@ class Mascot(QWidget):
 
         elif self._state == State.WALL_CLIMB:
             self._ay += CLIMB_SPEED * self._wall_climb_dir
+            self._state_ticks -= 1
             self._anim.advance()
+
+            # interrupt and stop for a bit then continue
+            if random.random() < 0.01:
+                self._enter(State.WALL_CLING)
+                return
+
             # Ceiling reached → swing to ceiling walk
             ceil_thresh = float(self._screen.top()) + self._anc_y + 40
             if self._wall_climb_dir == -1 and self._ay <= ceil_thresh:
@@ -915,6 +979,15 @@ class Mascot(QWidget):
                 self._dismiss()
                 return   # widget is gone; stop processing
 
+        elif self._state == State.SPRAWL:
+            self._state_ticks -= 1
+            self._anim.advance()
+            if self._state_ticks <= 0:
+                self._enter(random.choices(
+                    [State.IDLE, State.CRAWL, State.SIT], weights=[20, 50, 30]
+                )[0])
+    
+
         # ── Cross-state checks ─────────────────────────────────────────────────
 
         # Merge check (stable floor states only)
@@ -972,9 +1045,10 @@ class Mascot(QWidget):
                 app.primaryScreen().availableGeometry().size() if app else None
             )
 
-        # Exclude fullscreen-sized windows (the desktop background etc.)
+        # Exclude screen-sized windows (desktop background / root window proxies).
+        # Windows hidden behind fullscreen apps are already excluded by Environment._refresh().
         if screen_size is not None:
-            Mascot._valid_win = [w for w in all_win if w.rect.size() != screen_size]
+            Mascot._valid_win = [w for w in all_win if w.rect.size() != screen_size and w.rect.top() != 0 and w.rect.left() != 0]
         else:
             Mascot._valid_win = list(all_win)
 
@@ -1073,6 +1147,40 @@ class Mascot(QWidget):
         if self._jump_to(tx, ty):
             self._enter(State.JUMP)
 
+    def _try_win_climb(self):
+        if not Mascot._env or not Mascot._valid_win:
+            return
+
+        wins = Mascot._valid_win
+        # for wi in wins:
+        #     print(f"Window {wi.wid} at {wi.rect} (center {wi.rect.center()})")
+        w = min(wins, key=lambda w: abs(abs(float(w.rect.center().x())) - self._ax))
+        
+        self._climb_win = w
+        # print(f"Nearest: {w.rect} (center {w.rect.center()})")
+        
+        # Choose the closer vertical edge of the window
+        left_dist  = abs(self._ax - w.rect.left())
+        right_dist = abs(self._ax - w.rect.right())
+        if left_dist <= right_dist:
+            self._wall_side = "L"
+            # self._ax = float(w.rect.left())
+        else:
+            self._wall_side = "R"
+            # self._ax = float(w.rect.right())
+
+        # if not close enough, don't bother
+        if min(left_dist, right_dist) > JUMP_RANGE_X:
+            return
+
+        # Start at the window's bottom edge (clamped to the floor so we don't
+        # teleport the mascot if the window bottom is somehow off-screen)
+        self._ay  = min(float(w.rect.bottom()), self._floor_y())
+        self._vx  = 0.0
+        self._vy  = 0.0
+        self._enter(State.WIN_CLIMB)
+        
+
     def _maybe_grab_window(self):
         """Small chance each WALK tick to grab a nearby window and carry it."""
         if not Mascot._env or not Mascot._valid_win:
@@ -1110,7 +1218,7 @@ class Mascot(QWidget):
         w = min(wins, key=lambda w: abs(abs(float(w.rect.center().x())) - self._ax))
         
         self._climb_win = w
-        print(f"Nearest: {w.rect} (center {w.rect.center()})")
+        # print(f"Nearest: {w.rect} (center {w.rect.center()})")
         
         # Choose the closer vertical edge of the window
         left_dist  = abs(self._ax - w.rect.left())
@@ -1180,7 +1288,7 @@ class Mascot(QWidget):
             frame   = self._anim.current()
             flipped = self._facing_right
 
-        elif self._state in (State.SIT, State.SIT_SPINHEAD, State.SIT_LEDGE):
+        elif self._state in (State.SIT, State.SIT_SPINHEAD, State.SIT_LEDGE, State.SPRAWL):
             frame   = self._anim.current()
             flipped = self._facing_right
 
@@ -1188,7 +1296,7 @@ class Mascot(QWidget):
             frame   = self._anim.current()
             flipped = self._facing_right
 
-        elif self._state == State.WALK or self._state == State.RUN:
+        elif self._state in (State.WALK, State.RUN, State.CRAWL):
             frame   = self._anim.current()
             flipped = self._facing_right
 
@@ -1293,6 +1401,7 @@ class Mascot(QWidget):
         fa_walk      = force_menu.addAction("Walk")
         fa_run       = force_menu.addAction("Run")
         fa_jump       = force_menu.addAction("Jump")
+        fa_crawl     = force_menu.addAction("Crawl")
         force_menu.addSeparator()
         fa_wall_l    = force_menu.addAction("Climb left wall")
         fa_wall_r    = force_menu.addAction("Climb right wall")
@@ -1354,6 +1463,10 @@ class Mascot(QWidget):
         elif action == fa_run:
             self._ay = self._floor_y()
             self._enter(State.RUN)
+
+        elif action == fa_crawl:
+            self._ay = self._floor_y()
+            self._enter(State.CRAWL)
 
         elif action in (fa_wall_l, fa_wall_r):
             side = "L" if action == fa_wall_l else "R"
@@ -1452,6 +1565,7 @@ class DebugPanel(QWidget):
             lines.append(f"  state_ticks  {m._state_ticks}")
             lines.append(f"  pos          ({m._ax:.1f}, {m._ay:.1f})")
             lines.append(f"  vel          vx={m._vx:+.2f}  vy={m._vy:+.2f}")
+            lines.append(f"  left(): {m._left_x()}    right(): {m._right_x()}")
             lines.append(f"  floor_y      {m._floor_y():.1f}  on_floor={m._on_floor()}")
             lines.append(f"  facing       {'→' if m._facing_right else '←'}  "
                          f"wall_side={m._wall_side}  climb_dir={m._wall_climb_dir:+d}")

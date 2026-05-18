@@ -229,6 +229,8 @@ class LauncherWindow(QWidget):
         if Mascot._env is None:
             Mascot._env = Environment()
 
+        self._last_import_dir = str(Path.home())
+
         self._setup_ui()
 
         # Refresh running-count display every 500 ms
@@ -239,7 +241,7 @@ class LauncherWindow(QWidget):
     # ── UI construction ────────────────────────────────────────────────────────
 
     def _setup_ui(self):
-        self.setWindowTitle("Shimekami")
+        self.setWindowTitle("SHIMEKAMI")
         self.setFixedSize(420, 530)
         self.setWindowFlags(
             Qt.WindowType.Window |
@@ -577,43 +579,63 @@ class LauncherWindow(QWidget):
         self._populate_list()
 
     def _import_zip(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import Shimeji ZIP", str(Path.home()), "ZIP files (*.zip)"
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import Shimeji ZIP(s)", self._last_import_dir, "ZIP files (*.zip)"
         )
-        if not path:
+        if not paths:
             return
-        zip_path = Path(path)
-        name = self._ask_char_name(zip_path.stem)
-        if not name:
-            return
+        self._last_import_dir = str(Path(paths[0]).parent)
 
-        overwrite = False
-        if (CHARACTERS_DIR / name).exists():
-            if not self._confirm_overwrite(name):
-                return
-            overwrite = True
+        errors: list[str] = []
+        for path in paths:
+            zip_path = Path(path)
+            name = self._ask_char_name(zip_path.stem)
+            if not name:
+                continue
+            overwrite = False
+            if (CHARACTERS_DIR / name).exists():
+                if not self._confirm_overwrite(name):
+                    continue
+                overwrite = True
+            try:
+                msg = import_from_zip(zip_path, name, overwrite=overwrite)
+                QMessageBox.information(self, "Import complete", msg)
+            except Exception as e:
+                errors.append(f"{zip_path.name}: {e}")
 
-        self._run_import(import_from_zip, zip_path, name, overwrite=overwrite)
+        if errors:
+            QMessageBox.critical(self, "Import failed", "\n".join(errors))
+        self._populate_list()
 
     def _import_spritesheet(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import Spritesheet", str(Path.home()),
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import Spritesheet(s)", self._last_import_dir,
             "Images (*.png *.jpg *.jpeg *.webp)",
         )
-        if not path:
+        if not paths:
             return
-        img_path = Path(path)
-        name = self._ask_char_name(img_path.stem)
-        if not name:
-            return
+        self._last_import_dir = str(Path(paths[0]).parent)
 
-        overwrite = False
-        if (CHARACTERS_DIR / name).exists():
-            if not self._confirm_overwrite(name):
-                return
-            overwrite = True
+        errors: list[str] = []
+        for path in paths:
+            img_path = Path(path)
+            name = self._ask_char_name(img_path.stem)
+            if not name:
+                continue
+            overwrite = False
+            if (CHARACTERS_DIR / name).exists():
+                if not self._confirm_overwrite(name):
+                    continue
+                overwrite = True
+            try:
+                msg = import_from_spritesheet(img_path, name, overwrite=overwrite)
+                QMessageBox.information(self, "Import complete", msg)
+            except Exception as e:
+                errors.append(f"{img_path.name}: {e}")
 
-        self._run_import(import_from_spritesheet, img_path, name, overwrite=overwrite)
+        if errors:
+            QMessageBox.critical(self, "Import failed", "\n".join(errors))
+        self._populate_list()
 
     def _open_characters_folder(self):
         CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
