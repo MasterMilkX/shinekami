@@ -9,6 +9,7 @@ Usage:
 
 import re
 import sys
+import json
 import shutil
 import zipfile
 import tempfile
@@ -20,8 +21,9 @@ from PySide6.QtGui import QPixmap, QIcon, QFont
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QLabel,
-    QCheckBox, QFileDialog, QInputDialog, QMessageBox,
-    QGroupBox, QFrame, QSizePolicy, QMenu,
+    QCheckBox, QLineEdit, QFileDialog, QInputDialog, QMessageBox,
+    QGroupBox, QFrame, QSizePolicy, QMenu, QDialog,
+    QDialogButtonBox, QScrollArea,
 )
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
 _HERE          = Path(__file__).parent
 CHARACTERS_DIR = _HERE / "characters"
 TEMPLATE_DIR   = _HERE / "SHIMEJI-TEMPLATE" / "img" / "Shimeji"
+GROUPS_FILE    = _HERE / "groups.json"
 
 # ── shime## → animation filename map (1-indexed) ──────────────────────────────
 #
@@ -199,6 +202,69 @@ def list_characters() -> list[tuple[str, Path]]:
     return chars
 
 
+# ── Group persistence ──────────────────────────────────────────────────────────
+
+def load_groups() -> dict[str, list[str]]:
+    """Return {group_name: [char_name, ...]} from disk."""
+    try:
+        return json.loads(GROUPS_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_groups(groups: dict[str, list[str]]):
+    GROUPS_FILE.write_text(json.dumps(groups, indent=2))
+
+
+# ── Group creation dialog ──────────────────────────────────────────────────────
+
+class GroupDialog(QDialog):
+    """Let the user name a group and tick which characters belong to it."""
+
+    def __init__(self, parent, existing_name: str = "", existing_members: list[str] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Create / Edit Group")
+        self.setMinimumWidth(280)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Group name:"))
+        self._name_edit = QLineEdit(existing_name)
+        layout.addWidget(self._name_edit)
+
+        layout.addWidget(QLabel("Characters to include:"))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedHeight(200)
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setSpacing(2)
+
+        self._checkboxes: list[tuple[str, QCheckBox]] = []
+        for char_name, _ in list_characters():
+            cb = QCheckBox(char_name)
+            cb.setChecked(existing_members is not None and char_name in existing_members)
+            inner_layout.addWidget(cb)
+            self._checkboxes.append((char_name, cb))
+
+        inner_layout.addStretch()
+        scroll.setWidget(inner)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def result_name(self) -> str:
+        return re.sub(r"[^a-z0-9_ ]", "", self._name_edit.text().strip().lower())
+
+    def result_members(self) -> list[str]:
+        return [name for name, cb in self._checkboxes if cb.isChecked()]
+
+
 # ── Launcher window ────────────────────────────────────────────────────────────
 
 class LauncherWindow(QWidget):
@@ -329,16 +395,22 @@ class LauncherWindow(QWidget):
         settings_layout.setSpacing(4)
         settings_layout.setContentsMargins(8, 6, 8, 6)
 
-        self._cb_debug  = QCheckBox("Debug Panel")
-        self._cb_clone  = QCheckBox("Allow Cloning")
-        self._cb_throw  = QCheckBox("Allow Window Throwing")
+        self._cb_debug       = QCheckBox("Debug Panel")
+        self._cb_clone       = QCheckBox("Allow Cloning")
+        self._cb_throw       = QCheckBox("Allow Window Throwing")
+        self._cb_aware_same  = QCheckBox("Aware of Same Character")
+        self._cb_aware_other = QCheckBox("Aware of Other Characters")
 
         self._cb_clone.setChecked(self._Mascot._cloning_on)
         self._cb_throw.setChecked(self._Mascot._win_throw_on)
+        self._cb_aware_same.setChecked(self._Mascot._aware_same)
+        self._cb_aware_other.setChecked(self._Mascot._aware_other)
 
         self._cb_debug.toggled.connect(self._toggle_debug)
         self._cb_clone.toggled.connect(self._toggle_clone)
         self._cb_throw.toggled.connect(self._toggle_throw)
+        self._cb_aware_same.toggled.connect(self._toggle_aware_same)
+        self._cb_aware_other.toggled.connect(self._toggle_aware_other)
 
         row1 = QHBoxLayout()
         row1.addWidget(self._cb_debug)
@@ -346,6 +418,12 @@ class LauncherWindow(QWidget):
         row1.addWidget(self._cb_throw)
         row1.addStretch()
         settings_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(self._cb_aware_same)
+        row2.addWidget(self._cb_aware_other)
+        row2.addStretch()
+        settings_layout.addLayout(row2)
 
         root.addWidget(settings_box)
 
@@ -360,17 +438,20 @@ class LauncherWindow(QWidget):
         btn_zip     = QPushButton("Import ZIP…")
         btn_sheet   = QPushButton("Import Spritesheet…")
         btn_folder  = QPushButton("Show Folder")
+        self._btn_groups = QPushButton("Groups ▾")
         btn_killall = QPushButton("Kill All")
         btn_killall.setStyleSheet("QPushButton { color: #cc3333; }")
 
         btn_zip.clicked.connect(self._import_zip)
         btn_sheet.clicked.connect(self._import_spritesheet)
         btn_folder.clicked.connect(self._open_characters_folder)
+        self._btn_groups.clicked.connect(self._show_groups_menu)
         btn_killall.clicked.connect(self._kill_all)
 
         bottom.addWidget(btn_zip)
         bottom.addWidget(btn_sheet)
         bottom.addWidget(btn_folder)
+        bottom.addWidget(self._btn_groups)
         bottom.addStretch()
         bottom.addWidget(btn_killall)
 
@@ -447,6 +528,14 @@ class LauncherWindow(QWidget):
         self._cb_throw.blockSignals(True)
         self._cb_throw.setChecked(self._Mascot._win_throw_on)
         self._cb_throw.blockSignals(False)
+
+        self._cb_aware_same.blockSignals(True)
+        self._cb_aware_same.setChecked(self._Mascot._aware_same)
+        self._cb_aware_same.blockSignals(False)
+
+        self._cb_aware_other.blockSignals(True)
+        self._cb_aware_other.setChecked(self._Mascot._aware_other)
+        self._cb_aware_other.blockSignals(False)
 
     def _on_select(self):
         """Update the preview panel when the selection changes."""
@@ -548,6 +637,12 @@ class LauncherWindow(QWidget):
     def _toggle_throw(self, checked: bool):
         self._Mascot._win_throw_on = checked
 
+    def _toggle_aware_same(self, checked: bool):
+        self._Mascot._aware_same = checked
+
+    def _toggle_aware_other(self, checked: bool):
+        self._Mascot._aware_other = checked
+
     # ── Import helpers ────────────────────────────────────────────────────────
 
     def _ask_char_name(self, default: str) -> str | None:
@@ -636,6 +731,90 @@ class LauncherWindow(QWidget):
         if errors:
             QMessageBox.critical(self, "Import failed", "\n".join(errors))
         self._populate_list()
+
+    # ── Group management ──────────────────────────────────────────────────────
+
+    def _show_groups_menu(self):
+        groups = load_groups()
+        menu = QMenu(self)
+
+        if groups:
+            for group_name, members in groups.items():
+                act = menu.addAction(f"Spawn: {group_name}")
+                act.setData(("spawn", group_name, members))
+            menu.addSeparator()
+
+        act_create = menu.addAction("Create Group…")
+        act_delete = menu.addAction("Delete Group…")
+        act_delete.setEnabled(bool(groups))
+
+        chosen = menu.exec(
+            self._btn_groups.mapToGlobal(self._btn_groups.rect().bottomLeft())
+        )
+        if not chosen:
+            return
+
+        data = chosen.data()
+        if data and data[0] == "spawn":
+            self._spawn_group(data[2])
+        elif chosen is act_create:
+            self._create_group()
+        elif chosen is act_delete:
+            self._delete_group()
+
+    def _spawn_group(self, members: list[str]):
+        char_map = {name: sprite_dir for name, sprite_dir in list_characters()}
+        spawned = 0
+        for char_name in members:
+            sprite_dir = char_map.get(char_name)
+            if sprite_dir is None:
+                continue
+            sprites = self._SprCache(sprite_dir)
+            self._spawn(sprites, self._screen)
+            spawned += 1
+        if spawned:
+            self._on_select()
+
+    def _create_group(self):
+        dlg = GroupDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dlg.result_name()
+        members = dlg.result_members()
+        if not name:
+            QMessageBox.warning(self, "Groups", "Please enter a group name.")
+            return
+        if not members:
+            QMessageBox.warning(self, "Groups", "Select at least one character.")
+            return
+        groups = load_groups()
+        if name in groups:
+            reply = QMessageBox.question(
+                self, "Groups", f"'{name}' already exists. Overwrite?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        groups[name] = members
+        save_groups(groups)
+
+    def _delete_group(self):
+        groups = load_groups()
+        if not groups:
+            return
+        name, ok = QInputDialog.getItem(
+            self, "Delete Group", "Choose group to delete:",
+            sorted(groups.keys()), editable=False,
+        )
+        if not ok:
+            return
+        reply = QMessageBox.question(
+            self, "Delete Group", f"Delete group '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            groups.pop(name, None)
+            save_groups(groups)
 
     def _open_characters_folder(self):
         CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)

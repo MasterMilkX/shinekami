@@ -62,12 +62,12 @@ ANIM: dict[str, list[tuple[str, int]]] = {
     "fall":  [("fall.png", 1)],
     "land":  [("land_crouch.png", 5), ("land_roll.png", 5)],
     "sit":   [("sit.png", 1)],
-    "sit_spinhead": [
+    "sit_ledge": [
         ("sit_lookup.png",    5), ("sit_spinhead_a.png", 5), ("sit_spinhead_d.png", 5),
         ("sit_spinhead_b.png",5), ("sit_spinhead_e.png", 5), ("sit_spinhead_c.png", 5),
         ("sit_spinhead_f.png",5), ("sit.png",            5),
     ],
-    "sit_ledge": [
+    "sit_spinhead": [
         ("ledge_sit_up.png", 8), ("ledge_sit.png",      8),
         ("ledge_dangle_a.png",6), ("ledge_dangle_b.png", 6),
         ("ledge_dangle_a.png",6), ("ledge_dangle_b.png", 6),
@@ -126,6 +126,7 @@ class State(Enum):
     DRAG       = auto()
     THROWN     = auto()
     JUMP       = auto()
+    FOLLOWING  = auto()    # walking toward a social target
     WALL_CLING = auto()
     WALL_CLIMB = auto()
     CEIL_CLING = auto()
@@ -392,6 +393,8 @@ class Mascot(QWidget):
     _env:          Environment    = None   # set by main() or launcher
     _cloning_on:   bool           = True
     _win_throw_on: bool           = False
+    _aware_same:   bool           = False   # social behaviours between same-character mascots
+    _aware_other:  bool           = True  # social behaviours between different characters
     _keep_alive:   bool           = False  # set True by launcher to prevent app quit
     _class_screen: "QRect | None" = None   # set by main(); launcher uses per-instance screen
     _valid_win:    "list | None"  = None   # populated each tick by _valid_windows()
@@ -450,8 +453,9 @@ class Mascot(QWidget):
         self._throw_vx      = 0.0
         self._throw_vy      = 0.0
 
-        self._state       = State.FALL
-        self._state_ticks = 0
+        self._state         = State.FALL
+        self._state_ticks   = 0
+        self._social_target: "Mascot | None" = None
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint    |
@@ -634,10 +638,12 @@ class Mascot(QWidget):
 
         elif state == State.SIT_SPINHEAD:
             self._anim.play(ANIM["sit_spinhead"])
+            self.uni_tick()
             self._vx = 0.0; self._vy = 0.0
 
         elif state == State.SIT_LEDGE:
             self._anim.play(ANIM["sit_ledge"])
+            self.uni_tick()
             self._vx = 0.0; self._vy = 0.0
 
         elif state == State.WIN_CLIMB:
@@ -651,6 +657,11 @@ class Mascot(QWidget):
         elif state == State.MERGING:
             self._anim.play(ANIM["clone"])
             self._vx = 0.0; self._vy = 0.0
+
+        elif state == State.FOLLOWING:
+            self._anim.play(ANIM["walk"])
+            self._state_ticks = random.randint(3, 8) * (1000 // TICK_MS)
+            self._vy = 0.0
 
         elif state == State.SPRAWL:
             self._anim.play(ANIM["sprawl"])
@@ -748,6 +759,30 @@ class Mascot(QWidget):
                     else:
                         self._try_win_climb()
 
+        elif self._state == State.FOLLOWING:
+            t = self._social_target
+            self._anim.advance()
+            if (t is None or t not in Mascot._all
+                    or not self._on_floor()
+                    or self._state_ticks <= 0):
+                self._social_target = None
+                self._enter(State.IDLE)
+            else:
+                self._state_ticks -= 1
+                dx = t._ax - self._ax
+                dist = abs(dx)
+                if dist < MERGE_DIST:
+                    # Close enough — stop and react socially
+                    self._social_target = None
+                    self._social_arrive(t)
+                else:
+                    self._facing_right = dx > 0
+                    self._vx = (WALK_SPEED if self._facing_right else -WALK_SPEED) * 1.5
+                    self._ax += self._vx
+                    self._anim.advance()
+                    if not self._on_floor():
+                        self._enter(State.FALL)
+
         elif self._state == State.FALL:
             self._vy = min(self._vy + GRAVITY, MAX_FALL_SPD)
             self._ay += self._vy
@@ -820,8 +855,9 @@ class Mascot(QWidget):
             if not self._on_floor():
                 self._enter(State.FALL)
             else:
+                self._state_ticks -= 1
                 self._anim.advance()
-                if self._anim.done:
+                if self._state_ticks <= 0:
                     self._enter(random.choices(
                         [State.SIT, State.SIT_SPINHEAD, State.SIT_LEDGE], weights=[20, 70, 10]
                     )[0])
@@ -966,9 +1002,9 @@ class Mascot(QWidget):
                     if self._ay <= win_top + FLOOR_MARGIN:
                         self._ay = win_top + FLOOR_MARGIN
                         if self._wall_side == "R":
-                            self._ax = self._ax - 4
+                            self._ax = self._ax - 8
                         else:
-                            self._ax = self._ax + 4
+                            self._ax = self._ax + 8
                         self._facing_right = (self._wall_side != "L")
                         self._climb_win = None
                         self._enter(State.IDLE)
@@ -993,6 +1029,11 @@ class Mascot(QWidget):
         # Merge check (stable floor states only)
         if self._state in (State.IDLE, State.SIT) and Mascot._cloning_on:
             self._check_merge()
+
+        # Social awareness tick (idle / walk / sit only, low probability)
+        if self._state in (State.IDLE, State.WALK, State.SIT):
+            if random.random() < 0.003:
+                self._social_tick()
 
         # Validate carried / climbed window is still alive
         if Mascot._env and Mascot._valid_win is not None:
@@ -1253,6 +1294,74 @@ class Mascot(QWidget):
                 other._enter(State.MERGING)
                 break
 
+    def _social_candidates(self) -> "list[Mascot]":
+        """Return mascots this instance is allowed to be socially aware of."""
+        candidates = []
+        for other in Mascot._all:
+            if other is self:
+                continue
+            if other._state in (State.DRAG, State.THROWN, State.MERGING,
+                                 State.CLONING, State.FOLLOWING):
+                continue
+            same = other._sprites._dir == self._sprites._dir
+            if same and Mascot._aware_same:
+                candidates.append(other)
+            elif not same and Mascot._aware_other:
+                candidates.append(other)
+        return candidates
+
+    def _social_tick(self):
+        """Occasionally pick a social behaviour toward a nearby mascot."""
+        candidates = self._social_candidates()
+        if not candidates:
+            return
+
+        # Prefer nearby mascots but allow any within a generous range
+        on_floor = [c for c in candidates
+                    if abs(c._ay - self._ay) < self._sh * 1.5]
+        pool = on_floor if on_floor else candidates
+        target = random.choice(pool)
+
+        roll = random.random()
+        if roll < 0.45:
+            # Follow / approach
+            self._social_target = target
+            self._enter(State.FOLLOWING)
+        elif roll < 0.75:
+            # Copy target's visible state
+            self._social_mimic(target)
+        else:
+            # Sit facing the target
+            self._facing_right = target._ax > self._ax
+            self._enter(State.SIT)
+
+    def _social_arrive(self, target: "Mascot"):
+        """Decide what to do once we've walked close to a target."""
+        roll = random.random()
+        if roll < 0.5:
+            # Mirror sit — face toward target
+            self._facing_right = target._ax > self._ax
+            self._enter(State.SIT)
+        elif roll < 0.80:
+            self._social_mimic(target)
+        else:
+            self._enter(State.IDLE)
+
+    def _social_mimic(self, target: "Mascot"):
+        """Copy a simple visible state from the target."""
+        copyable = {
+            State.IDLE:        State.IDLE,
+            State.SIT:         State.SIT,
+            State.SIT_SPINHEAD: State.SIT_SPINHEAD,
+            State.SPRAWL:      State.SPRAWL,
+        }
+        new_state = copyable.get(target._state)
+        if new_state is not None:
+            self._facing_right = target._ax > self._ax
+            self._enter(new_state)
+        else:
+            self._enter(State.IDLE)
+
     # ── Paint ─────────────────────────────────────────────────────────────────
 
     def paintEvent(self, _event):
@@ -1391,6 +1500,14 @@ class Mascot(QWidget):
         tog_throw.setCheckable(True)
         tog_throw.setChecked(Mascot._win_throw_on)
 
+        tog_aware_same = menu.addAction("Aware of same character")
+        tog_aware_same.setCheckable(True)
+        tog_aware_same.setChecked(Mascot._aware_same)
+
+        tog_aware_other = menu.addAction("Aware of other characters")
+        tog_aware_other.setCheckable(True)
+        tog_aware_other.setChecked(Mascot._aware_other)
+
         menu.addSeparator()
 
         # ── Force action submenu ──────────────────────────────────────────────
@@ -1436,6 +1553,10 @@ class Mascot(QWidget):
             Mascot._cloning_on = not Mascot._cloning_on
         elif action == tog_throw:
             Mascot._win_throw_on = not Mascot._win_throw_on
+        elif action == tog_aware_same:
+            Mascot._aware_same = not Mascot._aware_same
+        elif action == tog_aware_other:
+            Mascot._aware_other = not Mascot._aware_other
         elif action == debug_act:
             DebugPanel.toggle(self._screen)
         elif action == dismiss_act:
@@ -1591,6 +1712,11 @@ class DebugPanel(QWidget):
                     lines.append(f"  nearest_win  wid={nearest.wid}  \"{nearest.name}\"")
                     lines.append(f"               would-climb-side={side}  top={r.top()}")
                     lines.append(f"               left={r.left()}  right={r.right()}")
+            
+            if m._social_target:
+                lines.append(f"  social_target  #{Mascot._all.index(m._social_target) + 1} "
+                             f"\"{m._social_target._sprites._dir}\" in state {m._social_target._state.name}")
+            
             lines.append("")
 
         if Mascot._env and Mascot._valid_win is not None:
