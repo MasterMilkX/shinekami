@@ -1,0 +1,8 @@
+.claude
+.venv
+SHIMEJI-TEMPLATE/conf
+SHIMEJI-TEMPLATE/lib
+SHIMEJI-TEMPLATE/readme.txt
+SHIMEJI-TEMPLATE/Shimeji-ee.jar
+SHIMEJI-TEMPLATE/licence.txt
+SHIMEJI-TEMPLATE/.*
