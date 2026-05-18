@@ -371,9 +371,12 @@ class AnimPlayer:
 class Mascot(QWidget):
     # Shared class state
     _all:          list["Mascot"] = []
-    _env:          Environment    = None   # set by main()
+    _env:          Environment    = None   # set by main() or launcher
     _cloning_on:   bool           = True
     _win_throw_on: bool           = False
+    _keep_alive:   bool           = False  # set True by launcher to prevent app quit
+    _class_screen: "QRect | None" = None   # set by main(); launcher uses per-instance screen
+    _valid_win:    "list | None"  = None   # populated each tick by _valid_windows()
 
     def __init__(
         self,
@@ -460,7 +463,7 @@ class Mascot(QWidget):
         """Nearest floor surface below the anchor (screen bottom or window top)."""
         fy = float(self._screen.bottom())
         screen_top = float(self._screen.top())
-        if Mascot._env:
+        if Mascot._env and Mascot._valid_win:
             for w in Mascot._valid_win:
                 # Clamp to screen top — some windows extend slightly above the screen
                 # due to compositor shadows; treat them as starting at screen top.
@@ -919,7 +922,7 @@ class Mascot(QWidget):
             self._check_merge()
 
         # Validate carried / climbed window is still alive
-        if Mascot._env:
+        if Mascot._env and Mascot._valid_win is not None:
             active  = {w.wid for w in Mascot._valid_win}
             if self._carry_win and self._carry_win.wid not in active:
                 self._carry_win = None
@@ -951,7 +954,6 @@ class Mascot(QWidget):
     def _valid_windows():
         """Sets a list of valid windows that the shimeji can interact with"""
         if not Mascot._env:
-            # no valid windows because there's no env
             Mascot._valid_win = None
             return
 
@@ -959,7 +961,22 @@ class Mascot(QWidget):
         if not all_win:
             Mascot._valid_win = None
             return
-        Mascot._valid_win = [w for w in all_win if not Mascot._class_screen.size() == w.rect.size()]
+
+        # Determine screen size — prefer the cached class-level screen rect,
+        # fall back to Qt's primary screen if main() hasn't set it yet.
+        if Mascot._class_screen is not None:
+            screen_size = Mascot._class_screen.size()
+        else:
+            app = QApplication.instance()
+            screen_size = (
+                app.primaryScreen().availableGeometry().size() if app else None
+            )
+
+        # Exclude fullscreen-sized windows (the desktop background etc.)
+        if screen_size is not None:
+            Mascot._valid_win = [w for w in all_win if w.rect.size() != screen_size]
+        else:
+            Mascot._valid_win = list(all_win)
 
         # change the rect to a different value
         for vw in Mascot._valid_win:
@@ -992,7 +1009,7 @@ class Mascot(QWidget):
             return
 
         # Not yet tracking — find the window we're standing on
-        for w in Mascot._valid_win:
+        for w in (Mascot._valid_win or []):
             top = float(w.rect.top())
             if (w.rect.left() - self._anc_x <= self._ax <= w.rect.right() + self._anc_x
                     and abs(self._ay - top) <= FLOOR_MARGIN * 3):
@@ -1029,7 +1046,7 @@ class Mascot(QWidget):
         candidates: list[tuple[float, float, float]] = []  # (priority, tx, ty)
 
         # Window-top candidates: above current floor and within reach
-        if Mascot._env:
+        if Mascot._env and Mascot._valid_win:
             for w in Mascot._valid_win:
                 win_top = float(w.rect.top())
                 if win_top >= floor:
@@ -1112,9 +1129,11 @@ class Mascot(QWidget):
         self._enter(State.WIN_CLIMB)
 
     def _check_merge(self):
-        """Absorb a nearby mascot (random chance per tick)."""
+        """Absorb a nearby mascot of the same character (random chance per tick)."""
         for other in Mascot._all:
             if other is self:
+                continue
+            if other._sprites._dir != self._sprites._dir:
                 continue
             if other._state not in (State.IDLE, State.SIT, State.WALK):
                 continue
@@ -1379,7 +1398,7 @@ class Mascot(QWidget):
         self.close()
         if self in Mascot._all:
             Mascot._all.remove(self)
-        if not Mascot._all:
+        if not Mascot._all and not Mascot._keep_alive:
             QApplication.instance().quit()
 
 # ── Debug panel ───────────────────────────────────────────────────────────────
@@ -1460,7 +1479,7 @@ class DebugPanel(QWidget):
                     lines.append(f"               left={r.left()}  right={r.right()}")
             lines.append("")
 
-        if Mascot._env:
+        if Mascot._env and Mascot._valid_win is not None:
             nw = len(Mascot._valid_win)
             lines.append(f"── Detected windows ({nw})  {'─' * 20}")
             for w in Mascot._valid_win:
@@ -1492,14 +1511,23 @@ def _spawn(sprites: SpriteCache, screen: QRect, x: int | None = None) -> "Mascot
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Shimekami desktop mascot")
+    parser.add_argument(
+        "--character", default=None, metavar="DIR",
+        help="Path to a sprite directory (overrides built-in SHIMEJI-TEMPLATE)",
+    )
+    args, _unknown = parser.parse_known_args()
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
     Mascot._env = Environment()
 
-    screen  = app.primaryScreen().availableGeometry()
-    sprites = SpriteCache(SPRITE_DIR)
-
+    screen = app.primaryScreen().availableGeometry()
+    sprite_dir = Path(args.character) if args.character else SPRITE_DIR
+    sprites = SpriteCache(sprite_dir)
+    
     Mascot._class_screen = screen
 
     _spawn(sprites, screen)
