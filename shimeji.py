@@ -55,8 +55,8 @@ ANIM: dict[str, list[tuple[str, int]]] = {
         ("stand.png",  6), ("walk_b.png", 6),
     ],
     "run": [
-        ("stand.png",  3), ("walk_a.png", 4),
-        ("stand.png",  3), ("walk_b.png", 4),
+        ("stand.png",  2), ("walk_a.png", 2),
+        ("stand.png",  2), ("walk_b.png", 2),
     ],
     "jump":  [("jump.png", 1)],
     "fall":  [("fall.png", 1)],
@@ -461,7 +461,7 @@ class Mascot(QWidget):
         fy = float(self._screen.bottom())
         screen_top = float(self._screen.top())
         if Mascot._env:
-            for w in Mascot._env.windows:
+            for w in Mascot._valid_win:
                 # Clamp to screen top — some windows extend slightly above the screen
                 # due to compositor shadows; treat them as starting at screen top.
                 top = max(float(w.rect.top()), screen_top)
@@ -542,7 +542,7 @@ class Mascot(QWidget):
             elif near_R and not near_L: self._facing_right = False
             else:                       self._facing_right = random.choice([True, False])
             self._vx = WALK_SPEED if self._facing_right else -WALK_SPEED
-            self._vx *= 2 if state == State.RUN else 1
+            self._vx *= 4 if state == State.RUN else 1
             self._vy = 0.0
 
 
@@ -570,7 +570,7 @@ class Mascot(QWidget):
 
         elif state == State.WALL_CLING:
             self._anim.play(ANIM["wall_cling"])
-            self.uni_tick()
+            self._state_ticks = random.randint(100,500)
             self._vx = 0.0; self._vy = 0.0
             self._ax = self._wall_left_x() if self._wall_side == "L" else self._wall_right_x()
 
@@ -636,6 +636,7 @@ class Mascot(QWidget):
         # Only the first mascot drives the shared env refresh.
         if Mascot._env and Mascot._all and Mascot._all[0] is self:
             Mascot._env.tick()
+            Mascot._valid_windows()       # set valid windows
 
         if self._dragging:
             self.update()
@@ -681,7 +682,7 @@ class Mascot(QWidget):
                 else:
                     self._facing_right = not near_L
                     self._vx = WALK_SPEED if self._facing_right else -WALK_SPEED
-                    self._vx *= 2 if self._state == State.RUN else 1
+                    self._vx *= 4 if self._state == State.RUN else 1
 
             self._anim.advance()
             # Fall if walked off a window edge
@@ -877,6 +878,10 @@ class Mascot(QWidget):
                 # Fetch live position so the mascot rides the window as it moves
                 live = (Mascot._env.get_window_rect(self._climb_win.wid)
                         if Mascot._env else None)
+                # convert to positive
+                if live:
+                    live = QRect(abs(live.x()), abs(live.y()), live.width(), live.height())
+
                 if live is None:
                     self._climb_win = None
                     self._enter(State.FALL)
@@ -892,15 +897,14 @@ class Mascot(QWidget):
                     # slightly negative; never let the mascot climb off-screen.
                     win_top = max(float(live.top()), float(self._screen.top()))
                     if self._ay <= win_top + FLOOR_MARGIN:
-                        self._ay = win_top
-                        step = self._anc_x + 8
-                        if self._wall_side == "L":
-                            self._ax = float(live.left() + step)
+                        self._ay = win_top + FLOOR_MARGIN
+                        if self._wall_side == "R":
+                            self._ax = self._ax - 4
                         else:
-                            self._ax = float(live.right() - step)
+                            self._ax = self._ax + 4
                         self._facing_right = (self._wall_side != "L")
                         self._climb_win = None
-                        self._enter(State.SIT)
+                        self._enter(State.IDLE)
 
         elif self._state == State.MERGING:
             self._anim.advance()
@@ -916,7 +920,7 @@ class Mascot(QWidget):
 
         # Validate carried / climbed window is still alive
         if Mascot._env:
-            active = {w.wid for w in Mascot._env.windows}
+            active  = {w.wid for w in Mascot._valid_win}
             if self._carry_win and self._carry_win.wid not in active:
                 self._carry_win = None
                 if self._state in (State.CARRY, State.THROW_WIN):
@@ -944,6 +948,24 @@ class Mascot(QWidget):
             weights.append(2)
         self._enter(random.choices(choices, weights=weights)[0])
 
+    def _valid_windows():
+        """Sets a list of valid windows that the shimeji can interact with"""
+        if not Mascot._env:
+            # no valid windows because there's no env
+            Mascot._valid_win = None
+            return
+
+        all_win = Mascot._env.windows
+        if not all_win:
+            Mascot._valid_win = None
+            return
+        Mascot._valid_win = [w for w in all_win if not Mascot._class_screen.size() == w.rect.size()]
+
+        # change the rect to a different value
+        for vw in Mascot._valid_win:
+            vw.rect = Mascot._env.get_window_rect(vw.wid)
+            vw.rect = QRect(abs(vw.rect.x()), abs(vw.rect.y()), vw.rect.width(), vw.rect.height())
+
     def _track_floor_window(self):
         """
         If the mascot is standing on a window, apply that window's per-tick
@@ -970,7 +992,7 @@ class Mascot(QWidget):
             return
 
         # Not yet tracking — find the window we're standing on
-        for w in Mascot._env.windows:
+        for w in Mascot._valid_win:
             top = float(w.rect.top())
             if (w.rect.left() - self._anc_x <= self._ax <= w.rect.right() + self._anc_x
                     and abs(self._ay - top) <= FLOOR_MARGIN * 3):
@@ -1008,7 +1030,7 @@ class Mascot(QWidget):
 
         # Window-top candidates: above current floor and within reach
         if Mascot._env:
-            for w in Mascot._env.windows:
+            for w in Mascot._valid_win:
                 win_top = float(w.rect.top())
                 if win_top >= floor:
                     continue  # at or below current surface
@@ -1036,12 +1058,12 @@ class Mascot(QWidget):
 
     def _maybe_grab_window(self):
         """Small chance each WALK tick to grab a nearby window and carry it."""
-        if not Mascot._env or not Mascot._env.windows:
+        if not Mascot._env or not Mascot._valid_win:
             return
         if random.random() > 0.00005:
             return
         # Prefer the window whose horizontal centre is closest to the mascot.
-        wins = Mascot._env.windows
+        wins = Mascot._valid_win
         w = min(wins, key=lambda w: abs(w.rect.center().x() - self._ax))
         self._carry_win    = w
         self._facing_right = w.rect.center().x() > self._ax
@@ -1050,10 +1072,11 @@ class Mascot(QWidget):
 
     def _force_grab_window(self):
         """Immediately grab the nearest window and carry it (used by Force action menu)."""
-        if not Mascot._env or not Mascot._env.windows:
+        if not Mascot._env or not Mascot._valid_win:
             return
-        wins = Mascot._env.windows
+        wins = Mascot._valid_win
         w = min(wins, key=lambda w: abs(w.rect.center().x() - self._ax))
+        print(f"Nearest: {w.rect} (center {w.rect.center()})")
         self._carry_win    = w
         self._facing_right = w.rect.center().x() > self._ax
         self._throw_dir    = 1 if self._facing_right else -1
@@ -1062,24 +1085,25 @@ class Mascot(QWidget):
 
     def _force_climb_window(self):
         """Cling to the nearest window's side and crawl up to sit on its top."""
-        if not Mascot._env or not Mascot._env.windows:
+        if not Mascot._env or not Mascot._valid_win:
             return
-        wins = Mascot._env.windows
-        # filter out those with positions at 0, 0 or named "Desktop"
-        wins = [w for w in wins if not (w.rect.x() == 0 and w.rect.y() == 0) and w.name != "Desktop"]
-        for wi in wins:
-            print(f"Window {wi.wid} at {wi.rect} (center {wi.rect.center()})")
-        w = min(wins, key=lambda w: abs(w.rect.center().x() - self._ax))
+        wins = Mascot._valid_win
+        # for wi in wins:
+        #     print(f"Window {wi.wid} at {wi.rect} (center {wi.rect.center()})")
+        w = min(wins, key=lambda w: abs(abs(float(w.rect.center().x())) - self._ax))
+        
         self._climb_win = w
+        print(f"Nearest: {w.rect} (center {w.rect.center()})")
+        
         # Choose the closer vertical edge of the window
         left_dist  = abs(self._ax - w.rect.left())
         right_dist = abs(self._ax - w.rect.right())
         if left_dist <= right_dist:
             self._wall_side = "L"
-            self._ax = float(w.rect.left())
+            # self._ax = float(w.rect.left())
         else:
             self._wall_side = "R"
-            self._ax = float(w.rect.right())
+            # self._ax = float(w.rect.right())
         # Start at the window's bottom edge (clamped to the floor so we don't
         # teleport the mascot if the window bottom is somehow off-screen)
         self._ay  = min(float(w.rect.bottom()), self._floor_y())
@@ -1116,7 +1140,7 @@ class Mascot(QWidget):
 
         elif self._state == State.WIN_CLIMB:
             frame   = self._anim.current()
-            flipped = (self._wall_side != "L")
+            flipped = (self._wall_side == "L")
 
         elif self._state in (State.CEIL_CLING, State.CEIL_WALK):
             frame   = self._anim.current()
@@ -1161,9 +1185,12 @@ class Mascot(QWidget):
         if ceil_mode:
             # Nudge up a few pixels to better align the ceiling sprite's anchor.
             offset.setY(-48)
-        if self._state in (State.WALL_CLIMB, State.WALL_CLING, State.WIN_CLIMB):
+        if self._state in (State.WALL_CLIMB, State.WALL_CLING):
             # Nudge left/right to align the climbing sprite's anchor with the wall edge.
             offset.setX(-64 if self._wall_side == "L" else 64)
+
+        # if self._state == State.WIN_CLIMB:
+        #     offset.setX(-64 if self._wall_side == "L" else 64)
 
         if self._state == State.SIT_LEDGE:
             # Nudge down a few pixels to make the "ledge" sprites sit on the floor better.
@@ -1245,13 +1272,14 @@ class Mascot(QWidget):
         fa_idle      = force_menu.addAction("Idle")
         fa_sit       = force_menu.addAction("Sit")
         fa_walk      = force_menu.addAction("Walk")
+        fa_run       = force_menu.addAction("Run")
         fa_jump       = force_menu.addAction("Jump")
         force_menu.addSeparator()
         fa_wall_l    = force_menu.addAction("Climb left wall")
         fa_wall_r    = force_menu.addAction("Climb right wall")
         fa_ceiling   = force_menu.addAction("Go to ceiling")
         force_menu.addSeparator()
-        has_wins = bool(Mascot._env and Mascot._env.windows)
+        has_wins = bool(Mascot._env and Mascot._valid_win)
         fa_win_climb = force_menu.addAction("Climb nearest window")
         fa_win_climb.setEnabled(has_wins)
         fa_win_throw = force_menu.addAction("Throw nearest window")
@@ -1303,6 +1331,10 @@ class Mascot(QWidget):
         elif action == fa_walk:
             self._ay = self._floor_y()
             self._enter(State.WALK)
+
+        elif action == fa_run:
+            self._ay = self._floor_y()
+            self._enter(State.RUN)
 
         elif action in (fa_wall_l, fa_wall_r):
             side = "L" if action == fa_wall_l else "R"
@@ -1416,9 +1448,9 @@ class DebugPanel(QWidget):
                 lines.append(f"  carry_win    wid={m._carry_win.wid}  \"{m._carry_win.name}\"")
                 lines.append(f"               ({r.left()},{r.top()}) {r.width()}×{r.height()}")
             else:
-                if Mascot._env and Mascot._env.windows:
-                    nearest = min(Mascot._env.windows,
-                                  key=lambda w: abs(w.rect.center().x() - m._ax))
+                if Mascot._env and Mascot._valid_win:
+                    nearest = min(Mascot._valid_win,
+                                  key=lambda w: abs(abs(float(w.rect.center().x())) - m._ax))
                     r = nearest.rect
                     left_d  = abs(m._ax - r.left())
                     right_d = abs(m._ax - r.right())
@@ -1429,9 +1461,9 @@ class DebugPanel(QWidget):
             lines.append("")
 
         if Mascot._env:
-            nw = len(Mascot._env.windows)
+            nw = len(Mascot._valid_win)
             lines.append(f"── Detected windows ({nw})  {'─' * 20}")
-            for w in Mascot._env.windows:
+            for w in Mascot._valid_win:
                 r = w.rect
                 tags: list[str] = []
                 if any(m._climb_win and m._climb_win.wid == w.wid for m in Mascot._all):
@@ -1467,6 +1499,8 @@ def main():
 
     screen  = app.primaryScreen().availableGeometry()
     sprites = SpriteCache(SPRITE_DIR)
+
+    Mascot._class_screen = screen
 
     _spawn(sprites, screen)
 
