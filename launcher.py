@@ -18,11 +18,12 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QTimer, QPoint
 from PySide6.QtGui import QPixmap, QIcon, QFont
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QLabel,
     QCheckBox, QLineEdit, QFileDialog, QInputDialog, QMessageBox,
-    QGroupBox, QFrame, QSizePolicy, QMenu, QDialog,
+    QMenu, QMenuBar, QDialog,
     QDialogButtonBox, QScrollArea,
 )
 
@@ -32,6 +33,7 @@ _HERE          = Path(__file__).parent
 CHARACTERS_DIR = _HERE / "characters"
 TEMPLATE_DIR   = _HERE / "SHIMEJI-TEMPLATE" / "img" / "Shimeji"
 GROUPS_FILE    = _HERE / "groups.json"
+SETTINGS_FILE  = _HERE / "settings.json"
 
 # ── shime## → animation filename map (1-indexed) ──────────────────────────────
 #
@@ -215,6 +217,23 @@ def save_groups(groups: dict[str, list[str]]):
     GROUPS_FILE.write_text(json.dumps(groups, indent=2))
 
 
+def load_settings() -> dict:
+    defaults = {
+        "cloning_on":   True,
+        "win_throw_on": False,
+        "aware_same":   True,
+        "aware_other":  False,
+    }
+    try:
+        data = json.loads(SETTINGS_FILE.read_text())
+        return {**defaults, **data}
+    except Exception:
+        return defaults
+
+def save_settings(settings: dict):
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+
+
 # ── Group creation dialog ──────────────────────────────────────────────────────
 
 class GroupDialog(QDialog):
@@ -297,6 +316,13 @@ class LauncherWindow(QWidget):
 
         self._last_import_dir = str(Path.home())
 
+        # Apply persisted behaviour settings
+        s = load_settings()
+        Mascot._cloning_on   = s["cloning_on"]
+        Mascot._win_throw_on = s["win_throw_on"]
+        Mascot._aware_same   = s["aware_same"]
+        Mascot._aware_other  = s["aware_other"]
+
         self._setup_ui()
 
         # Refresh running-count display every 500 ms
@@ -307,16 +333,67 @@ class LauncherWindow(QWidget):
     # ── UI construction ────────────────────────────────────────────────────────
 
     def _setup_ui(self):
-        self.setWindowTitle("SHIMEKAMI")
-        self.setFixedSize(420, 530)
-        self.setWindowFlags(
-            Qt.WindowType.Window |
-            Qt.WindowType.WindowStaysOnTopHint
-        )
+        self.setWindowTitle("Shimekami")
+        self.setFixedSize(420, 400)
+        self.setWindowFlags(Qt.WindowType.Window)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Menu bar ──────────────────────────────────────────────────────────
+        menubar = QMenuBar(self)
+        root.addWidget(menubar)
+
+        # File menu
+        file_menu = menubar.addMenu("File")
+        act_zip   = file_menu.addAction("Import ZIP…")
+        act_sheet = file_menu.addAction("Import Spritesheet…")
+        file_menu.addSeparator()
+        act_folder = file_menu.addAction("Show Characters Folder")
+        act_zip.triggered.connect(self._import_zip)
+        act_sheet.triggered.connect(self._import_spritesheet)
+        act_folder.triggered.connect(self._open_characters_folder)
+
+        # Behavior menu
+        beh_menu = menubar.addMenu("Behavior")
+        self._act_debug = QAction("Debug Panel", self)
+        self._act_debug.setCheckable(True)
+        self._act_clone = QAction("Allow Cloning", self)
+        self._act_clone.setCheckable(True)
+        self._act_clone.setChecked(self._Mascot._cloning_on)
+        self._act_throw = QAction("Allow Window Throwing", self)
+        self._act_throw.setCheckable(True)
+        self._act_throw.setChecked(self._Mascot._win_throw_on)
+        beh_menu.addAction(self._act_debug)
+        beh_menu.addSeparator()
+        beh_menu.addAction(self._act_clone)
+        beh_menu.addAction(self._act_throw)
+        beh_menu.addSeparator()
+        self._act_aware_same = QAction("Aware of Same Character", self)
+        self._act_aware_same.setCheckable(True)
+        self._act_aware_same.setChecked(self._Mascot._aware_same)
+        self._act_aware_other = QAction("Aware of Other Characters", self)
+        self._act_aware_other.setCheckable(True)
+        self._act_aware_other.setChecked(self._Mascot._aware_other)
+        beh_menu.addAction(self._act_aware_same)
+        beh_menu.addAction(self._act_aware_other)
+        self._act_debug.toggled.connect(self._toggle_debug)
+        self._act_clone.toggled.connect(self._toggle_clone)
+        self._act_throw.toggled.connect(self._toggle_throw)
+        self._act_aware_same.toggled.connect(self._toggle_aware_same)
+        self._act_aware_other.toggled.connect(self._toggle_aware_other)
+
+        # Groups menu
+        self._groups_menu = menubar.addMenu("Groups")
+        self._groups_menu.aboutToShow.connect(self._rebuild_groups_menu)
+
+        # ── Content area ──────────────────────────────────────────────────────
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(10, 8, 10, 10)
+        content_layout.setSpacing(8)
+        root.addWidget(content)
 
         # ── Header ────────────────────────────────────────────────────────────
         header = QLabel("Shimekami")
@@ -324,12 +401,12 @@ class LauncherWindow(QWidget):
         f.setPointSize(14)
         f.setBold(True)
         header.setFont(f)
-        root.addWidget(header)
+        content_layout.addWidget(header)
 
         # ── Character list + preview ──────────────────────────────────────────
         body = QHBoxLayout()
         body.setSpacing(8)
-        root.addLayout(body)
+        content_layout.addLayout(body)
 
         # Left: list
         list_col = QVBoxLayout()
@@ -352,10 +429,15 @@ class LauncherWindow(QWidget):
         char_btns.setSpacing(4)
         self._btn_launch = QPushButton("Launch")
         self._btn_launch.clicked.connect(self._launch)
-        self._btn_kill   = QPushButton("Kill Selected")
+        self._btn_kill = QPushButton("Kill Selected")
         self._btn_kill.clicked.connect(self._kill_selected)
+        btn_killall = QPushButton("Kill All")
+        btn_killall.setStyleSheet("QPushButton { color: #cc3333; }")
+        btn_killall.clicked.connect(self._kill_all)
         char_btns.addWidget(self._btn_launch)
         char_btns.addWidget(self._btn_kill)
+        char_btns.addStretch()
+        char_btns.addWidget(btn_killall)
         list_col.addLayout(char_btns)
 
         # Right: preview panel
@@ -386,84 +468,8 @@ class LauncherWindow(QWidget):
 
         right_col.addStretch()
 
-        # ── Separator ─────────────────────────────────────────────────────────
-        root.addWidget(self._hline())
-
-        # ── Settings group ────────────────────────────────────────────────────
-        settings_box = QGroupBox("Global Settings")
-        settings_layout = QVBoxLayout(settings_box)
-        settings_layout.setSpacing(4)
-        settings_layout.setContentsMargins(8, 6, 8, 6)
-
-        self._cb_debug       = QCheckBox("Debug Panel")
-        self._cb_clone       = QCheckBox("Allow Cloning")
-        self._cb_throw       = QCheckBox("Allow Window Throwing")
-        self._cb_aware_same  = QCheckBox("Aware of Same Character")
-        self._cb_aware_other = QCheckBox("Aware of Other Characters")
-
-        self._cb_clone.setChecked(self._Mascot._cloning_on)
-        self._cb_throw.setChecked(self._Mascot._win_throw_on)
-        self._cb_aware_same.setChecked(self._Mascot._aware_same)
-        self._cb_aware_other.setChecked(self._Mascot._aware_other)
-
-        self._cb_debug.toggled.connect(self._toggle_debug)
-        self._cb_clone.toggled.connect(self._toggle_clone)
-        self._cb_throw.toggled.connect(self._toggle_throw)
-        self._cb_aware_same.toggled.connect(self._toggle_aware_same)
-        self._cb_aware_other.toggled.connect(self._toggle_aware_other)
-
-        row1 = QHBoxLayout()
-        row1.addWidget(self._cb_debug)
-        row1.addWidget(self._cb_clone)
-        row1.addWidget(self._cb_throw)
-        row1.addStretch()
-        settings_layout.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        row2.addWidget(self._cb_aware_same)
-        row2.addWidget(self._cb_aware_other)
-        row2.addStretch()
-        settings_layout.addLayout(row2)
-
-        root.addWidget(settings_box)
-
-        # ── Separator ─────────────────────────────────────────────────────────
-        root.addWidget(self._hline())
-
-        # ── Import + kill-all row ─────────────────────────────────────────────
-        bottom = QHBoxLayout()
-        bottom.setSpacing(6)
-        root.addLayout(bottom)
-
-        btn_zip     = QPushButton("Import ZIP…")
-        btn_sheet   = QPushButton("Import Spritesheet…")
-        btn_folder  = QPushButton("Show Folder")
-        self._btn_groups = QPushButton("Groups ▾")
-        btn_killall = QPushButton("Kill All")
-        btn_killall.setStyleSheet("QPushButton { color: #cc3333; }")
-
-        btn_zip.clicked.connect(self._import_zip)
-        btn_sheet.clicked.connect(self._import_spritesheet)
-        btn_folder.clicked.connect(self._open_characters_folder)
-        self._btn_groups.clicked.connect(self._show_groups_menu)
-        btn_killall.clicked.connect(self._kill_all)
-
-        bottom.addWidget(btn_zip)
-        bottom.addWidget(btn_sheet)
-        bottom.addWidget(btn_folder)
-        bottom.addWidget(self._btn_groups)
-        bottom.addStretch()
-        bottom.addWidget(btn_killall)
-
         # Populate list
         self._populate_list()
-
-    @staticmethod
-    def _hline() -> QFrame:
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        return line
 
     # ── Character list helpers ─────────────────────────────────────────────────
 
@@ -506,8 +512,7 @@ class LauncherWindow(QWidget):
     # ── Sync UI state ─────────────────────────────────────────────────────────
 
     def _sync_ui(self):
-        """Called periodically to sync running counts and checkbox states."""
-        # Update running count label
+        """Called periodically to sync running counts and menu action states."""
         sel = self._current_char()
         if sel:
             running = len(self._running_for(sel[1]))
@@ -515,27 +520,16 @@ class LauncherWindow(QWidget):
                 f"{running} running" if running != 1 else "1 running"
             )
 
-        # Sync debug checkbox without triggering the signal
-        self._cb_debug.blockSignals(True)
-        self._cb_debug.setChecked(self._DebugPanel.is_visible())
-        self._cb_debug.blockSignals(False)
-
-        # Sync cloning / throwing (user might change via right-click menu)
-        self._cb_clone.blockSignals(True)
-        self._cb_clone.setChecked(self._Mascot._cloning_on)
-        self._cb_clone.blockSignals(False)
-
-        self._cb_throw.blockSignals(True)
-        self._cb_throw.setChecked(self._Mascot._win_throw_on)
-        self._cb_throw.blockSignals(False)
-
-        self._cb_aware_same.blockSignals(True)
-        self._cb_aware_same.setChecked(self._Mascot._aware_same)
-        self._cb_aware_same.blockSignals(False)
-
-        self._cb_aware_other.blockSignals(True)
-        self._cb_aware_other.setChecked(self._Mascot._aware_other)
-        self._cb_aware_other.blockSignals(False)
+        for act, value in (
+            (self._act_debug,       self._DebugPanel.is_visible()),
+            (self._act_clone,       self._Mascot._cloning_on),
+            (self._act_throw,       self._Mascot._win_throw_on),
+            (self._act_aware_same,  self._Mascot._aware_same),
+            (self._act_aware_other, self._Mascot._aware_other),
+        ):
+            act.blockSignals(True)
+            act.setChecked(value)
+            act.blockSignals(False)
 
     def _on_select(self):
         """Update the preview panel when the selection changes."""
@@ -633,15 +627,27 @@ class LauncherWindow(QWidget):
 
     def _toggle_clone(self, checked: bool):
         self._Mascot._cloning_on = checked
+        self._save_settings()
 
     def _toggle_throw(self, checked: bool):
         self._Mascot._win_throw_on = checked
+        self._save_settings()
 
     def _toggle_aware_same(self, checked: bool):
         self._Mascot._aware_same = checked
+        self._save_settings()
 
     def _toggle_aware_other(self, checked: bool):
         self._Mascot._aware_other = checked
+        self._save_settings()
+
+    def _save_settings(self):
+        save_settings({
+            "cloning_on":   self._Mascot._cloning_on,
+            "win_throw_on": self._Mascot._win_throw_on,
+            "aware_same":   self._Mascot._aware_same,
+            "aware_other":  self._Mascot._aware_other,
+        })
 
     # ── Import helpers ────────────────────────────────────────────────────────
 
@@ -734,33 +740,26 @@ class LauncherWindow(QWidget):
 
     # ── Group management ──────────────────────────────────────────────────────
 
-    def _show_groups_menu(self):
+    def _rebuild_groups_menu(self):
+        """Rebuild the Groups menu each time it is opened."""
+        self._groups_menu.clear()
         groups = load_groups()
-        menu = QMenu(self)
+
+        act_create = self._groups_menu.addAction("Create Group…")
+        act_create.triggered.connect(self._create_group)
+
+        act_delete = self._groups_menu.addAction("Delete Group…")
+        act_delete.setEnabled(bool(groups))
+        act_delete.triggered.connect(self._delete_group)
 
         if groups:
+            self._groups_menu.addSeparator()
+            spawn_menu = self._groups_menu.addMenu("Spawn Group")
             for group_name, members in groups.items():
-                act = menu.addAction(f"Spawn: {group_name}")
-                act.setData(("spawn", group_name, members))
-            menu.addSeparator()
-
-        act_create = menu.addAction("Create Group…")
-        act_delete = menu.addAction("Delete Group…")
-        act_delete.setEnabled(bool(groups))
-
-        chosen = menu.exec(
-            self._btn_groups.mapToGlobal(self._btn_groups.rect().bottomLeft())
-        )
-        if not chosen:
-            return
-
-        data = chosen.data()
-        if data and data[0] == "spawn":
-            self._spawn_group(data[2])
-        elif chosen is act_create:
-            self._create_group()
-        elif chosen is act_delete:
-            self._delete_group()
+                act = spawn_menu.addAction(group_name)
+                act.triggered.connect(
+                    lambda checked=False, m=members: self._spawn_group(m)
+                )
 
     def _spawn_group(self, members: list[str]):
         char_map = {name: sprite_dir for name, sprite_dir in list_characters()}

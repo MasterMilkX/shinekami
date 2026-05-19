@@ -782,8 +782,6 @@ class Mascot(QWidget):
 
         elif self._state == State.FOLLOWING:
             t = self._social_target
-            self._anim.advance()
-
             if (t is None or t not in Mascot._all
                     or not self._on_floor()
                     or self._state_ticks <= 0):
@@ -794,7 +792,6 @@ class Mascot(QWidget):
                 dx = t._ax - self._ax
                 dist = abs(dx)
                 if dist < MERGE_DIST:
-                    # Close enough — stop and react socially
                     self._social_target = None
                     self._social_arrive(t)
                 else:
@@ -891,7 +888,7 @@ class Mascot(QWidget):
         elif self._state == State.WALL_CLING:
             self._state_ticks -= 1
             if self._state_ticks <= 0:
-                if random.random() < 0.7:
+                if random.random() < 0.9:
                     self._enter(State.WALL_CLIMB)
                 else:
                     self._enter(State.FALL)   # give up, drop off
@@ -1479,9 +1476,9 @@ class Mascot(QWidget):
         # if self._state == State.WIN_CLIMB:
         #     offset.setX(-64 if self._wall_side == "L" else 64)
 
-        if self._state == State.SIT_LEDGE:
-            # Nudge down a few pixels to make the "ledge" sprites sit on the floor better.
-            offset.setY(16)
+        # if self._state == State.SIT_LEDGE:
+        #     # Nudge down a few pixels to make the "ledge" sprites sit on the floor better.
+        #     offset.setY(16)
 
         if not offset.isNull():
             p.translate(offset)
@@ -1877,7 +1874,7 @@ class DebugPanel(QWidget):
         self.setWindowTitle("Shimekami – Debug")
         self.resize(460, 420)
         self.move(screen.right() - 480, screen.top() + 20)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        # self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -1898,8 +1895,9 @@ class DebugPanel(QWidget):
         lines: list[str] = []
 
         for i, m in enumerate(Mascot._all):
-            sep = "─" * 28
-            lines.append(f"── Mascot #{i + 1}  {sep}")
+            char_name = m._sprites._dir.name
+            sep = "─" * max(1, 28 - len(char_name))
+            lines.append(f"── {char_name} #{i + 1}  {sep}")
             lines.append(f"  state        {m._state.name}")
             lines.append(f"  state_ticks  {m._state_ticks}")
             lines.append(f"  pos          ({m._ax:.1f}, {m._ay:.1f})")
@@ -1959,7 +1957,10 @@ class DebugPanel(QWidget):
         else:
             lines.append("── No X11 environment ─────────────────")
 
+        sb = self._text.verticalScrollBar()
+        pos = sb.value()
         self._text.setPlainText("\n".join(lines))
+        sb.setValue(pos)
 
 # ── Spawn helper ──────────────────────────────────────────────────────────────
 
