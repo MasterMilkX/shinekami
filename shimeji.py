@@ -14,8 +14,8 @@ import random
 from pathlib import Path
 from enum import Enum, auto
 
-from PySide6.QtCore import Qt, QTimer, QPoint, QRect
-from PySide6.QtGui import QPixmap, QPainter, QTransform, QCursor, QFont
+from PySide6.QtCore import Qt, QTimer, QPoint, QRect, QObject
+from PySide6.QtGui import QPixmap, QPainter, QTransform, QCursor, QFont, QColor, QPen, QBrush, QPolygon
 from PySide6.QtWidgets import QApplication, QWidget, QMenu, QTextEdit, QVBoxLayout
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -46,6 +46,21 @@ JUMP_VY       = -50.0  # initial upward speed for spontaneous jumps (px/tick)
 JUMP_RANGE_Y  = 400    # max upward distance to a jump target (px)
 JUMP_RANGE_X  = 500    # max horizontal distance to a jump target (px)
 
+CHAT_DIST     = 160    # max anchor distance to start a conversation
+BUBBLE_MS     = 1600   # ms each speech bubble is visible
+BUBBLE_GAP_MS = 300    # ms pause between turns
+
+CHAT_EMOJIS: list[str] = [
+    # Expressions
+    "😁", "😄", "😮", "😅", "🤔", "😤", "😳", "🥺", "😏", "🤩",
+    "😴", "💤", "😜", "🤗", "😬", "😶", "🙄", "😑",
+    # Food
+    "🍕", "🍜", "🍩", "🍪", "☕", "🍵", "🍎", "🍓", "🍦",
+    # Reactions / objects
+    "👀", "👋", "👍", "👏", "❤️", "💔", "💭", "❓", "❗", "✨",
+    "⭐", "🌙", "☀️", "🌸", "🎵", "🎶", "🔥", "💥", "💫",
+]
+
 # ── Animation sequences ───────────────────────────────────────────────────────
 
 ANIM: dict[str, list[tuple[str, int]]] = {
@@ -63,15 +78,15 @@ ANIM: dict[str, list[tuple[str, int]]] = {
     "land":  [("land_crouch.png", 5), ("land_roll.png", 5)],
     "sit":   [("sit.png", 1)],
     "sit_ledge": [
-        ("sit_lookup.png",    5), ("sit_spinhead_a.png", 5), ("sit_spinhead_d.png", 5),
-        ("sit_spinhead_b.png",5), ("sit_spinhead_e.png", 5), ("sit_spinhead_c.png", 5),
-        ("sit_spinhead_f.png",5), ("sit.png",            5),
+        ("sit_lookup.png",    20), ("sit_spinhead_a.png", 20), ("sit_spinhead_d.png", 20),
+        ("sit_spinhead_b.png",20), ("sit_spinhead_e.png", 20), ("sit_spinhead_c.png", 20),
+        ("sit_spinhead_f.png",20), ("sit.png",            20),
     ],
     "sit_spinhead": [
         ("ledge_sit_up.png", 8), ("ledge_sit.png",      8),
-        ("ledge_dangle_a.png",6), ("ledge_dangle_b.png", 6),
-        ("ledge_dangle_a.png",6), ("ledge_dangle_b.png", 6),
-        ("ledge_dangle_a.png",6), ("ledge_dangle_b.png", 6),
+        ("ledge_dangle_a.png",20), ("ledge_dangle_b.png", 20),
+        ("ledge_dangle_a.png",20), ("ledge_dangle_b.png", 20),
+        ("ledge_dangle_a.png",20), ("ledge_dangle_b.png", 20),
     ],
     "sprawl":[("sprawl.png", 1)],
 
@@ -127,6 +142,7 @@ class State(Enum):
     THROWN     = auto()
     JUMP       = auto()
     FOLLOWING  = auto()    # walking toward a social target
+    CHATTING   = auto()    # mid-emoji conversation
     WALL_CLING = auto()
     WALL_CLIMB = auto()
     CEIL_CLING = auto()
@@ -391,7 +407,7 @@ class Mascot(QWidget):
     # Shared class state
     _all:          list["Mascot"] = []
     _env:          Environment    = None   # set by main() or launcher
-    _cloning_on:   bool           = True
+    _cloning_on:   bool                                                                                                                            = True
     _win_throw_on: bool           = False
     _aware_same:   bool           = False   # social behaviours between same-character mascots
     _aware_other:  bool           = True  # social behaviours between different characters
@@ -455,7 +471,8 @@ class Mascot(QWidget):
 
         self._state         = State.FALL
         self._state_ticks   = 0
-        self._social_target: "Mascot | None" = None
+        self._social_target:  "Mascot | None"        = None
+        self._conversation:   "Conversation | None"  = None
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint    |
@@ -659,9 +676,13 @@ class Mascot(QWidget):
             self._vx = 0.0; self._vy = 0.0
 
         elif state == State.FOLLOWING:
-            self._anim.play(ANIM["walk"])
+            self._anim.play(ANIM["run"])
             self._state_ticks = random.randint(3, 8) * (1000 // TICK_MS)
             self._vy = 0.0
+
+        elif state == State.CHATTING:
+            self._anim.play(ANIM["idle"])
+            self._vx = 0.0; self._vy = 0.0
 
         elif state == State.SPRAWL:
             self._anim.play(ANIM["sprawl"])
@@ -762,6 +783,7 @@ class Mascot(QWidget):
         elif self._state == State.FOLLOWING:
             t = self._social_target
             self._anim.advance()
+
             if (t is None or t not in Mascot._all
                     or not self._on_floor()
                     or self._state_ticks <= 0):
@@ -782,6 +804,10 @@ class Mascot(QWidget):
                     self._anim.advance()
                     if not self._on_floor():
                         self._enter(State.FALL)
+
+        elif self._state == State.CHATTING:
+            if not self._on_floor() or self._conversation is None:
+                self._end_conversation()
 
         elif self._state == State.FALL:
             self._vy = min(self._vy + GRAVITY, MAX_FALL_SPD)
@@ -1301,7 +1327,7 @@ class Mascot(QWidget):
             if other is self:
                 continue
             if other._state in (State.DRAG, State.THROWN, State.MERGING,
-                                 State.CLONING, State.FOLLOWING):
+                                 State.CLONING, State.FOLLOWING, State.CHATTING):
                 continue
             same = other._sprites._dir == self._sprites._dir
             if same and Mascot._aware_same:
@@ -1316,35 +1342,60 @@ class Mascot(QWidget):
         if not candidates:
             return
 
-        # Prefer nearby mascots but allow any within a generous range
         on_floor = [c for c in candidates
                     if abs(c._ay - self._ay) < self._sh * 1.5]
         pool = on_floor if on_floor else candidates
         target = random.choice(pool)
 
         roll = random.random()
-        if roll < 0.45:
+        if roll < 0.35:
             # Follow / approach
             self._social_target = target
             self._enter(State.FOLLOWING)
-        elif roll < 0.75:
-            # Copy target's visible state
+        elif roll < 0.55:
+            # Start a conversation if close enough, otherwise approach first
+            if abs(target._ax - self._ax) < CHAT_DIST:
+                self._begin_chat(target)
+            else:
+                self._social_target = target
+                self._enter(State.FOLLOWING)
+        elif roll < 0.78:
             self._social_mimic(target)
         else:
-            # Sit facing the target
             self._facing_right = target._ax > self._ax
             self._enter(State.SIT)
 
     def _social_arrive(self, target: "Mascot"):
         """Decide what to do once we've walked close to a target."""
         roll = random.random()
-        if roll < 0.5:
-            # Mirror sit — face toward target
+        if roll < 0.45:
+            self._begin_chat(target)
+        elif roll < 0.75:
             self._facing_right = target._ax > self._ax
             self._enter(State.SIT)
-        elif roll < 0.80:
+        elif roll < 0.90:
             self._social_mimic(target)
         else:
+            self._enter(State.IDLE)
+
+    def _begin_chat(self, other: "Mascot"):
+        """Start a 3-5 turn emoji conversation with other."""
+        if other._state == State.CHATTING or self._conversation is not None:
+            self._enter(State.IDLE)
+            return
+        turns = random.randint(3, 5)
+        conv = Conversation(self, other, turns)
+        self._conversation = conv
+        other._conversation = conv
+        self._facing_right = other._ax > self._ax
+        other._facing_right = self._ax > other._ax
+        self._enter(State.CHATTING)
+        other._enter(State.CHATTING)
+
+    def _end_conversation(self):
+        """Called by Conversation when it finishes, or if interrupted."""
+        self._conversation = None
+        if self._state == State.CHATTING:
             self._enter(State.IDLE)
 
     def _social_mimic(self, target: "Mascot"):
@@ -1532,6 +1583,9 @@ class Mascot(QWidget):
         force_menu.addSeparator()
         fa_clone     = force_menu.addAction("Clone now")
         fa_clone.setEnabled(len(Mascot._all) < MAX_MASCOTS)
+        force_menu.addSeparator()
+        fa_chat = force_menu.addAction("Chat with nearest")
+        fa_chat.setEnabled(len(Mascot._all) > 1)
 
         menu.addSeparator()
         debug_act = menu.addAction("Debug panel")
@@ -1627,13 +1681,177 @@ class Mascot(QWidget):
                 self._vy = JUMP_VY
                 self._enter(State.JUMP)
 
+        elif action == fa_chat:
+            others = [m for m in Mascot._all if m is not self
+                      and m._state not in (State.DRAG, State.THROWN, State.CHATTING)]
+            if others:
+                nearest = min(others, key=lambda m: abs(m._ax - self._ax))
+                self._begin_chat(nearest)
+
     def _dismiss(self):
+        if self._conversation is not None:
+            self._conversation.abort()
         self._timer.stop()
         self.close()
         if self in Mascot._all:
             Mascot._all.remove(self)
         if not Mascot._all and not Mascot._keep_alive:
             QApplication.instance().quit()
+
+# ── Speech bubble ────────────────────────────────────────────────────────────
+
+class SpeechBubble(QWidget):
+    """
+    Frameless, transparent overlay that draws a rounded speech bubble
+    with an emoji, positioned above a mascot's head.
+    Auto-closes after `duration_ms` milliseconds.
+    """
+
+    _PAD    = 10   # px padding inside bubble
+    _POINT  = 10   # px height of the pointer triangle
+    _RADIUS = 10   # corner radius
+    _FONT_SIZE = 28
+
+    def __init__(self, mascot: "Mascot", emoji: str, duration_ms: int):
+        super().__init__()
+        self._emoji = emoji
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint  |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool                 |
+            Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        # Measure emoji to size the widget
+        self.setFont(self._emoji_font())
+        fm = self.fontMetrics()
+        ew   = fm.horizontalAdvance(emoji) + self._PAD * 2
+        eh   = fm.height() + self._PAD * 2
+        total_w = max(ew, 48)
+        total_h = eh + self._POINT
+        self.setFixedSize(total_w, total_h)
+
+        # Position: centered above the mascot's head
+        head_x = mascot.x() + mascot.width() // 2
+        head_y = mascot.y()
+        self.move(head_x - total_w // 2, head_y - total_h - 4)
+
+        self.show()
+
+        self._close_timer = QTimer(self)
+        self._close_timer.setSingleShot(True)
+        self._close_timer.timeout.connect(self.close)
+        self._close_timer.start(duration_ms)
+
+    def _emoji_font(self) -> QFont:
+        f = QFont()
+        for family in ("Noto Color Emoji", "Segoe UI Emoji", "Apple Color Emoji", ""):
+            f.setFamily(family)
+            if family:
+                break
+        f.setPointSize(self._FONT_SIZE)
+        return f
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w, h = self.width(), self.height()
+        bh   = h - self._POINT          # bubble body height
+        cx   = w // 2
+
+        # Bubble body
+        p.setPen(QPen(QColor(200, 200, 200), 1))
+        p.setBrush(QBrush(QColor(255, 255, 255, 230)))
+        p.drawRoundedRect(0, 0, w, bh, self._RADIUS, self._RADIUS)
+
+        # Pointer triangle (downward)
+        tri = QPolygon([
+            QPoint(cx - 7, bh),
+            QPoint(cx + 7, bh),
+            QPoint(cx,     bh + self._POINT),
+        ])
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(255, 255, 255, 230)))
+        p.drawPolygon(tri)
+
+        # Emoji text
+        p.setFont(self._emoji_font())
+        p.setPen(QColor(0, 0, 0))
+        p.drawText(0, 0, w, bh, Qt.AlignmentFlag.AlignCenter, self._emoji)
+
+
+# ── Conversation coordinator ──────────────────────────────────────────────────
+
+class Conversation(QObject):
+    """
+    Manages a 3-5 turn emoji exchange between two mascots.
+    Uses a single-shot QTimer to drive alternating turns.
+    Either mascot can call abort() to cancel early (e.g. on dismiss).
+    """
+
+    def __init__(self, initiator: "Mascot", responder: "Mascot", total_turns: int):
+        super().__init__()
+        self._a          = initiator
+        self._b          = responder
+        self._turns_left = total_turns
+        self._whose      = 0          # 0 = initiator's turn, 1 = responder's
+        self._aborted    = False
+        self._bubble: SpeechBubble | None = None
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._advance)
+        self._do_turn()
+
+    def _pick_emoji(self) -> str:
+        return random.choice(CHAT_EMOJIS)
+
+    def _speaker(self) -> "Mascot":
+        return self._a if self._whose == 0 else self._b
+
+    def _do_turn(self):
+        if self._aborted:
+            return
+        speaker = self._speaker()
+        if speaker not in Mascot._all:
+            self.abort()
+            return
+        self._bubble = SpeechBubble(speaker, self._pick_emoji(), BUBBLE_MS)
+        self._timer.start(BUBBLE_MS + BUBBLE_GAP_MS)
+
+    def _advance(self):
+        if self._aborted:
+            return
+        self._turns_left -= 1
+        if self._turns_left <= 0:
+            self._finish()
+        else:
+            self._whose ^= 1
+            self._do_turn()
+
+    def _finish(self):
+        self._aborted = True
+        self._timer.stop()
+        for m in (self._a, self._b):
+            if m in Mascot._all:
+                m._end_conversation()
+
+    def abort(self):
+        if self._aborted:
+            return
+        self._aborted = True
+        self._timer.stop()
+        if self._bubble and not self._bubble.isHidden():
+            self._bubble.close()
+        for m in (self._a, self._b):
+            if m in Mascot._all and m._conversation is self:
+                m._conversation = None
+                if m._state == State.CHATTING:
+                    m._enter(State.IDLE)
+
 
 # ── Debug panel ───────────────────────────────────────────────────────────────
 
