@@ -232,11 +232,13 @@ class Environment:
                 return
             stacked_wids = [int(w) for w in stk_prop.value]
 
-            # Single pass: collect valid window info in stacking order and track
-            # the highest index occupied by a fullscreen window.
-            # stacked_wids[0] is the bottommost window, stacked_wids[-1] is topmost.
-            top_fs_idx  = -1
-            candidates  = []   # (stack_idx, WindowInfo)
+            # Single pass: collect valid window info in stacking order.
+            # Track fullscreen windows as (stack_idx, rect) pairs so we can do
+            # per-monitor occlusion: a window is hidden only when a *higher-stacked*
+            # fullscreen window geometrically overlaps it on the same monitor.
+            # Pure stacking-order exclusion wrongly drops windows on other monitors.
+            fullscreen_info: list[tuple[int, QRect]] = []  # (stack_idx, rect)
+            candidates: list[tuple[int, WindowInfo]] = []
 
             for idx, wid in enumerate(stacked_wids):
                 if wid in self._own_wids:
@@ -254,7 +256,14 @@ class Environment:
                     states = set(ws_prop.value) if (ws_prop and ws_prop.value) else set()
 
                     if self._atom_fullscreen in states:
-                        top_fs_idx = idx
+                        try:
+                            geom_fs = w.get_geometry()
+                            tr_fs   = self._root.translate_coords(w, 0, 0)
+                            fullscreen_info.append(
+                                (idx, QRect(tr_fs.x, tr_fs.y, geom_fs.width, geom_fs.height))
+                            )
+                        except Exception:
+                            pass
                         continue
                     if self._atom_hidden in states:
                         continue
@@ -272,7 +281,7 @@ class Environment:
                             pass
 
                     geom = w.get_geometry()
-                    tr   = w.translate_coords(self._root, 0, 0)
+                    tr   = self._root.translate_coords(w, 0, 0)
                     rect = QRect(tr.x, tr.y, geom.width, geom.height)
                     if rect.width() <= 80 or rect.height() <= 80:
                         continue
@@ -303,9 +312,18 @@ class Environment:
                 except Exception:
                     pass
 
-            # Discard any window that sits below (or at) the topmost fullscreen
-            # window — those are fully occluded and should be off-limits.
-            self._windows = [wi for idx, wi in candidates if idx > top_fs_idx]
+            # A window is occluded when a *higher-stacked* fullscreen window
+            # geometrically intersects it (same monitor).  Using stacking idx
+            # means popups that appear *above* the fullscreen stay visible.
+            def _occluded(candidate_idx: int, wi_rect: QRect) -> bool:
+                for fs_idx, fs_rect in fullscreen_info:
+                    if fs_idx > candidate_idx and fs_rect.intersects(wi_rect):
+                        return True
+                return False
+
+            self._windows = [
+                wi for idx, wi in candidates if not _occluded(idx, wi.rect)
+            ]
             self._xd.flush()
         except Exception:
             pass
@@ -317,7 +335,7 @@ class Environment:
         try:
             w  = self._xd.create_resource_object("window", wid)
             g  = w.get_geometry()
-            tr = w.translate_coords(self._root, 0, 0)
+            tr = self._root.translate_coords(w, 0, 0)
             return QRect(tr.x, tr.y, g.width, g.height)
         except Exception:
             return None
@@ -504,8 +522,8 @@ class Mascot(QWidget):
         screen_top = float(self._screen.top())
         if Mascot._env and Mascot._valid_win:
             for w in Mascot._valid_win:
-                # Clamp to screen top — some windows extend slightly above the screen
-                # due to compositor shadows; treat them as starting at screen top.
+                # Clamp to screen top — compositor shadows can push rect.top()
+                # into negative territory; treat those as starting at screen top.
                 top = max(float(w.rect.top()), screen_top)
                 if (w.rect.left() - self._anc_x <= self._ax <= w.rect.right() + self._anc_x
                         and self._ay <= top + FLOOR_MARGIN
@@ -614,13 +632,16 @@ class Mascot(QWidget):
             self._anim.play(ANIM["wall_cling"])
             self._state_ticks = random.randint(100,300)
             self._vx = 0.0; self._vy = 0.0
-            self._ax = self._wall_left_x() if self._wall_side == "L" else self._wall_right_x()
+            ax = self._wall_left_x() if self._wall_side == "L" else self._wall_right_x()
+            # Clamp to own screen so we don't drift onto an adjacent monitor.
+            self._ax = max(float(self._screen.left()), min(float(self._screen.right()), ax))
 
         elif state == State.WALL_CLIMB:
             self._anim.play(ANIM["wall_climb"])
             self._state_ticks = random.randint(200,500)
             self._vx = 0.0
-            self._ax = self._wall_left_x() if self._wall_side == "L" else self._wall_right_x()
+            ax = self._wall_left_x() if self._wall_side == "L" else self._wall_right_x()
+            self._ax = max(float(self._screen.left()), min(float(self._screen.right()), ax))
 
         elif state == State.CEIL_CLING:
             self._anim.play(ANIM["ceil_cling"])
@@ -928,14 +949,18 @@ class Mascot(QWidget):
         elif self._state == State.CEIL_WALK:
             self._ax += self._vx
             self._anim.advance()
-            # Hit ceiling edge → descend wall
-            if self._ax <= self._wall_left_x():
-                self._ax = self._wall_left_x()
+            # Hit ceiling edge → descend wall.  Use screen bounds as the trigger
+            # so the mascot never walks off onto an adjacent monitor.
+            sl, sr = float(self._screen.left()), float(self._screen.right())
+            edge_l = max(self._wall_left_x(),  sl)
+            edge_r = min(self._wall_right_x(), sr)
+            if self._ax <= edge_l:
+                self._ax = edge_l
                 self._wall_side      = "L"
                 self._wall_climb_dir = 1
                 self._enter(State.WALL_CLIMB)
-            elif self._ax >= self._wall_right_x():
-                self._ax = self._wall_right_x()
+            elif self._ax >= edge_r:
+                self._ax = edge_r
                 self._wall_side      = "R"
                 self._wall_climb_dir = 1
                 self._enter(State.WALL_CLIMB)
@@ -1004,9 +1029,6 @@ class Mascot(QWidget):
                 # Fetch live position so the mascot rides the window as it moves
                 live = (Mascot._env.get_window_rect(self._climb_win.wid)
                         if Mascot._env else None)
-                # convert to positive
-                if live:
-                    live = QRect(abs(live.x()), abs(live.y()), live.width(), live.height())
 
                 if live is None:
                     self._climb_win = None
@@ -1089,7 +1111,7 @@ class Mascot(QWidget):
         self._enter(random.choices(choices, weights=weights)[0])
 
     def _valid_windows():
-        """Sets a list of valid windows that the shimeji can interact with"""
+        """Sets a list of valid windows that the shimeji can interact with."""
         if not Mascot._env:
             Mascot._valid_win = None
             return
@@ -1099,27 +1121,56 @@ class Mascot(QWidget):
             Mascot._valid_win = None
             return
 
-        # Determine screen size — prefer the cached class-level screen rect,
-        # fall back to Qt's primary screen if main() hasn't set it yet.
-        if Mascot._class_screen is not None:
-            screen_size = Mascot._class_screen.size()
-        else:
+        # Collect FULL screen geometry (not availableGeometry) so that a
+        # maximised browser that fills only the available area isn't confused
+        # with the desktop background, which fills the full screen including
+        # the taskbar strip.  Rects come from _refresh() with no abs() applied.
+        app = QApplication.instance()
+        screen_full_geoms: list[QRect] = (
+            [s.geometry() for s in app.screens()] if app else []
+        )
+
+        def _is_desktop(w: WindowInfo) -> bool:
+            for g in screen_full_geoms:
+                # Desktop background / root-window proxy: exactly spans a
+                # screen's full geometry and is anchored at its origin.
+                if (w.rect.size() == g.size()):
+                    return True
+            return False
+
+        def _in_corner(w: WindowInfo):
+            # for g in screen_full_geoms:
+            #     # Windows anchored in a screen corner with a size smaller than
+            #     # the full screen are likely docked toolbars or panels, not
+            #     # valid surfaces for the mascot to interact with.
+            #     wh = (w.rect.width()  < g.width() * 0.75 and w.rect.height() < g.height() * 0.75)
+            #     hs = (abs(w.rect.left() - g.left()) <= 4 or abs(w.rect.right() - g.right()) <= 4) 
+            #     vs = (abs(w.rect.top() - g.top()) <= 4 or  abs(w.rect.bottom() - g.bottom()) <= 4)
+
+            #     if wh or hs or vs:
+            #         return True
+            # return False
             app = QApplication.instance()
-            screen_size = (
-                app.primaryScreen().availableGeometry().size() if app else None
+            screen_full_geoms: list[QRect] = (
+                [s.geometry() for s in app.screens()] if app else []
             )
 
-        # Exclude screen-sized windows (desktop background / root window proxies).
-        # Windows hidden behind fullscreen apps are already excluded by Environment._refresh().
-        if screen_size is not None:
-            Mascot._valid_win = [w for w in all_win if w.rect.size() != screen_size and w.rect.top() != 0 and w.rect.left() != 0]
-        else:
-            Mascot._valid_win = list(all_win)
+            for g in screen_full_geoms:
+                # Windows anchored in a screen corner with a size smaller than
+                # the full screen are likely docked toolbars or panels, not
+                # valid surfaces for the mascot to interact with.
+                wh = not (w.rect.width()  < g.width() * 0.75 and w.rect.height() < g.height() * 0.75)
+                hs = (abs(w.rect.left() - g.left()) <= 4 or abs(w.rect.right() - g.right()) <= 4) 
+                vs = (abs(w.rect.top() - g.top()) <= 4 or  abs(w.rect.bottom() - g.bottom()) <= 4)
 
-        # change the rect to a different value
-        for vw in Mascot._valid_win:
-            vw.rect = Mascot._env.get_window_rect(vw.wid)
-            vw.rect = QRect(abs(vw.rect.x()), abs(vw.rect.y()), vw.rect.width(), vw.rect.height())
+                if wh or hs or vs:
+                    return True, [wh, hs, vs]
+            return False, ['x','x','x']
+
+        Mascot._valid_win = [w for w in all_win if not (_in_corner(w)[0] or _is_desktop(w))]
+        # for w in all_win:
+        #     ic, d = _in_corner(w)
+        #     print(f"{w.name}: {ic} [{d}] - ({w.rect.left()}, {w.rect.top()})")
 
     def _track_floor_window(self):
         """
@@ -1141,13 +1192,18 @@ class Mascot(QWidget):
                     self._ay += dy
                 if abs(dx) < 500:
                     self._ax += dx
+                    # Clamp after riding a window so we don't cross into another monitor.
+                    self._ax = max(float(self._screen.left()),
+                                   min(float(self._screen.right()), self._ax))
             self._floor_win_prev_rect = live
             if live is None:
                 self._floor_win_wid = None
             return
 
-        # Not yet tracking — find the window we're standing on
+        # Not yet tracking — find the window we're standing on.
         for w in (Mascot._valid_win or []):
+            if not w:
+                continue
             top = float(w.rect.top())
             if (w.rect.left() - self._anc_x <= self._ax <= w.rect.right() + self._anc_x
                     and abs(self._ay - top) <= FLOOR_MARGIN * 3):
@@ -1186,6 +1242,8 @@ class Mascot(QWidget):
         # Window-top candidates: above current floor and within reach
         if Mascot._env and Mascot._valid_win:
             for w in Mascot._valid_win:
+                if not w:
+                    continue
                 win_top = float(w.rect.top())
                 if win_top >= floor:
                     continue  # at or below current surface
@@ -1216,9 +1274,7 @@ class Mascot(QWidget):
             return
 
         wins = Mascot._valid_win
-        # for wi in wins:
-        #     print(f"Window {wi.wid} at {wi.rect} (center {wi.rect.center()})")
-        w = min(wins, key=lambda w: abs(abs(float(w.rect.center().x())) - self._ax))
+        w = min(wins, key=lambda w: abs(float(w.rect.center().x()) - self._ax))
         
         self._climb_win = w
         # print(f"Nearest: {w.rect} (center {w.rect.center()})")
@@ -1251,7 +1307,6 @@ class Mascot(QWidget):
             return
         if random.random() > 0.00005:
             return
-        # Prefer the window whose horizontal centre is closest to the mascot.
         wins = Mascot._valid_win
         w = min(wins, key=lambda w: abs(w.rect.center().x() - self._ax))
         self._carry_win    = w
@@ -1277,9 +1332,7 @@ class Mascot(QWidget):
         if not Mascot._env or not Mascot._valid_win:
             return
         wins = Mascot._valid_win
-        # for wi in wins:
-        #     print(f"Window {wi.wid} at {wi.rect} (center {wi.rect.center()})")
-        w = min(wins, key=lambda w: abs(abs(float(w.rect.center().x())) - self._ax))
+        w = min(wins, key=lambda w: abs(float(w.rect.center().x()) - self._ax))
         
         self._climb_win = w
         # print(f"Nearest: {w.rect} (center {w.rect.center()})")
@@ -1874,7 +1927,7 @@ class DebugPanel(QWidget):
         self.setWindowTitle("Shimekami – Debug")
         self.resize(460, 420)
         self.move(screen.right() - 480, screen.top() + 20)
-        # self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -1890,6 +1943,24 @@ class DebugPanel(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
         self._timer.start(TICK_MS * 2)
+
+    def in_corner_ext(self,w: WindowInfo):
+        app = QApplication.instance()
+        screen_full_geoms: list[QRect] = (
+            [s.geometry() for s in app.screens()] if app else []
+        )
+
+        for g in screen_full_geoms:
+            # Windows anchored in a screen corner with a size smaller than
+            # the full screen are likely docked toolbars or panels, not
+            # valid surfaces for the mascot to interact with.
+            wh = not (w.rect.width()  < g.width() * 0.75 and w.rect.height() < g.height() * 0.75)
+            hs = (abs(w.rect.left() - g.left()) <= 4 or abs(w.rect.right() - g.right()) <= 4) 
+            vs = (abs(w.rect.top() - g.top()) <= 4 or  abs(w.rect.bottom() - g.bottom()) <= 4)
+
+            if wh or hs or vs:
+                return True, [wh, hs, vs]
+        return False, ['x','x','x']
 
     def _refresh(self):
         lines: list[str] = []
@@ -1907,6 +1978,7 @@ class DebugPanel(QWidget):
             lines.append(f"  facing       {'→' if m._facing_right else '←'}  "
                          f"wall_side={m._wall_side}  climb_dir={m._wall_climb_dir:+d}")
 
+
             if m._climb_win:
                 r = m._climb_win.rect
                 lines.append(f"  climb_win    wid={m._climb_win.wid}  \"{m._climb_win.name}\"")
@@ -1919,8 +1991,11 @@ class DebugPanel(QWidget):
                 lines.append(f"               ({r.left()},{r.top()}) {r.width()}×{r.height()}")
             else:
                 if Mascot._env and Mascot._valid_win:
-                    nearest = min(Mascot._valid_win,
-                                  key=lambda w: abs(abs(float(w.rect.center().x())) - m._ax))
+                    same_screen = [w for w in Mascot._valid_win if m._screen.intersects(w.rect)]
+                    if not same_screen:
+                        same_screen = Mascot._valid_win
+                    nearest = min(same_screen,
+                                  key=lambda w: abs(float(w.rect.center().x()) - m._ax))
                     r = nearest.rect
                     left_d  = abs(m._ax - r.left())
                     right_d = abs(m._ax - r.right())
@@ -1954,6 +2029,16 @@ class DebugPanel(QWidget):
                     f"\"{title}\""
                     f"{tag_str}"
                 )
+            
+            # show other windows
+            # lines.append(f"=> All windows ({len(Mascot._env.windows)}) <{'='*20}")
+            # for w in Mascot._env.windows:
+            #     r = w.rect
+            #     title = "-+-" + ((w.name[:32] + "…") if len(w.name) > 33 else w.name)
+            #     lines.append(title)
+            #     in_corn = self.in_corner_ext(w)
+            #     lines.append(f"     in_corner  {in_corn[0]}  (wh={in_corn[1][0]} hs={in_corn[1][1]} vs={in_corn[1][2]})")
+            #     lines.append(f"     ({r.left():5},{r.top():5}) @ {r.width():4}×{r.height():<4} ")
         else:
             lines.append("── No X11 environment ─────────────────")
 
