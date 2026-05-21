@@ -14,6 +14,7 @@ import random
 import queue
 import threading
 import json
+import time
 import urllib.request
 import unicodedata
 from pathlib import Path
@@ -56,6 +57,8 @@ JUMP_RANGE_X  = 400    # max horizontal distance to a jump target (px)
 CHAT_DIST     = 160    # max anchor distance to start a conversation
 BUBBLE_MS     = 1600   # ms each speech bubble is visible
 BUBBLE_GAP_MS = 300    # ms pause between turns
+
+SHOW_LLM_RESP = False
 
 # All named codepoints in the standard emoji unicode ranges.
 _EMOJI_RANGES = [
@@ -143,6 +146,14 @@ class LLMController:
     """
     _instance: "LLMController | None" = None
 
+    # Shared status — read by DebugPanel from the main thread
+    total_requests: int        = 0
+    total_ok:       int        = 0
+    total_errors:   int        = 0
+    last_emoji:     str        = ""
+    last_error:     str        = ""
+    last_elapsed_ms: float     = 0.0
+
     @classmethod
     def get(cls) -> "LLMController":
         if cls._instance is None:
@@ -160,17 +171,31 @@ class LLMController:
 
     def request(self, personality: str, memory_text: str,
                 partner_name: str, partner_last_emoji: str, callback):
+        LLMController.total_requests += 1
         self._req_q.put((personality, memory_text, partner_name,
                           partner_last_emoji, callback))
 
     def _worker(self):
         while True:
             personality, memory_text, partner_name, partner_last, cb = self._req_q.get()
+            t0 = time.monotonic()
             try:
                 result = self._call_ollama(personality, memory_text,
                                            partner_name, partner_last)
-            except Exception:
+                elapsed = (time.monotonic() - t0) * 1000
+                LLMController.total_ok      += 1
+                LLMController.last_emoji     = result or ""
+                LLMController.last_error     = ""
+                LLMController.last_elapsed_ms = elapsed
+                if SHOW_LLM_RES:
+                    print(f"[LLM] ✓ {elapsed:.0f}ms → {result!r}", flush=True)
+            except Exception as exc:
+                elapsed = (time.monotonic() - t0) * 1000
+                LLMController.total_errors  += 1
+                LLMController.last_error     = str(exc)
+                LLMController.last_elapsed_ms = elapsed
                 result = None
+                print(f"[LLM] ✗ {elapsed:.0f}ms — {exc}", flush=True)
             self._res_q.put((cb, result))
 
     @staticmethod
@@ -188,7 +213,7 @@ class LLMController:
                      partner_name: str, partner_last: str) -> str | None:
         favor = self._extract_favor(personality)
         favor_line = (
-            f"\nYou strongly prefer these emojis: {favor}"
+            f"\nYou strongly prefer these emojis: {favor}. Use them where you can and as appropriate to be as in character as possible."
             if favor else ""
         )
         prompt = (
@@ -212,7 +237,8 @@ class LLMController:
         )
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read())
-        return data["message"]["content"].strip() or None
+
+        return data["message"]["content"].strip()[:5] or None
 
     def _drain(self):
         while not self._res_q.empty():
@@ -2272,6 +2298,23 @@ class DebugPanel(QWidget):
             #     lines.append(f"     ({r.left():5},{r.top():5}) @ {r.width():4}×{r.height():<4} ")
         else:
             lines.append("── No X11 environment ─────────────────")
+
+        # ── LLM status ────────────────────────────────────────────────────────
+        lines.append("")
+        llm_on = Mascot._llm_enabled
+        lines.append(f"── LLM  ({'ON' if llm_on else 'off'})  ─────────────────────────")
+        if llm_on:
+            ctrl = LLMController  # class-level counters, no instantiation needed
+            lines.append(f"  model        {LLM_MODEL}")
+            lines.append(f"  endpoint     {LLM_ENDPOINT}")
+            lines.append(f"  requests     {ctrl.total_requests}  "
+                         f"(✓ {ctrl.total_ok}  ✗ {ctrl.total_errors})")
+            if ctrl.last_elapsed_ms:
+                lines.append(f"  last time    {ctrl.last_elapsed_ms:.0f} ms")
+            if ctrl.last_emoji:
+                lines.append(f"  last reply   {ctrl.last_emoji}")
+            if ctrl.last_error:
+                lines.append(f"  last error   {ctrl.last_error}")
 
         sb = self._text.verticalScrollBar()
         pos = sb.value()
