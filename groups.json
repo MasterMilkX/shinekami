@@ -10,5 +10,10 @@
     "akai",
     "link",
     "midori4"
+  ],
+  "llm_test": [
+    "default",
+    "gir",
+    "link"
   ]
 }

@@ -14,6 +14,7 @@ import shutil
 import zipfile
 import tempfile
 import subprocess
+import importlib.util
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QTimer, QPoint
@@ -223,6 +224,7 @@ def load_settings() -> dict:
         "win_throw_on": False,
         "aware_same":   True,
         "aware_other":  False,
+        "llm_enabled":  False,
     }
     try:
         data = json.loads(SETTINGS_FILE.read_text())
@@ -299,13 +301,24 @@ class LauncherWindow(QWidget):
         self._screen = screen
         self._app    = app
 
-        # Lazy import — shimeji.py's module level is safe to import.
-        from shimeji import Mascot, Environment, SpriteCache, DebugPanel, _spawn
-        self._Mascot     = Mascot
-        self._Env        = Environment
-        self._SprCache   = SpriteCache
-        self._DebugPanel = DebugPanel
-        self._spawn      = _spawn
+        # Load shimeji-llm.py via importlib (hyphen in filename prevents normal import).
+        _llm_path = _HERE / "shimeji-llm.py"
+        _spec = importlib.util.spec_from_file_location("shimeji_llm", _llm_path)
+        _mod  = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+
+        Mascot     = _mod.Mascot
+        Environment = _mod.Environment
+        SpriteCache = _mod.SpriteCache
+        DebugPanel  = _mod.DebugPanel
+        _spawn      = _mod._spawn
+
+        self._Mascot          = Mascot
+        self._Env             = Environment
+        self._SprCache        = SpriteCache
+        self._DebugPanel      = DebugPanel
+        self._spawn           = _spawn
+        self._PersonalitiesDir = _mod.PERSONALITIES_DIR
 
         # Tell mascots not to quit the app when the last one is dismissed.
         Mascot._keep_alive = True
@@ -322,6 +335,7 @@ class LauncherWindow(QWidget):
         Mascot._win_throw_on = s["win_throw_on"]
         Mascot._aware_same   = s["aware_same"]
         Mascot._aware_other  = s["aware_other"]
+        Mascot._llm_enabled  = s["llm_enabled"]
 
         self._setup_ui()
 
@@ -378,11 +392,17 @@ class LauncherWindow(QWidget):
         self._act_aware_other.setChecked(self._Mascot._aware_other)
         beh_menu.addAction(self._act_aware_same)
         beh_menu.addAction(self._act_aware_other)
+        beh_menu.addSeparator()
+        self._act_llm = QAction("Use LLM for Conversations", self)
+        self._act_llm.setCheckable(True)
+        self._act_llm.setChecked(self._Mascot._llm_enabled)
+        beh_menu.addAction(self._act_llm)
         self._act_debug.toggled.connect(self._toggle_debug)
         self._act_clone.toggled.connect(self._toggle_clone)
         self._act_throw.toggled.connect(self._toggle_throw)
         self._act_aware_same.toggled.connect(self._toggle_aware_same)
         self._act_aware_other.toggled.connect(self._toggle_aware_other)
+        self._act_llm.toggled.connect(self._toggle_llm)
 
         # Groups menu
         self._groups_menu = menubar.addMenu("Groups")
@@ -466,6 +486,22 @@ class LauncherWindow(QWidget):
         self._lbl_count.setFixedWidth(110)
         right_col.addWidget(self._lbl_count)
 
+        self._lbl_personality = QLabel("")
+        self._lbl_personality.setFixedWidth(110)
+        self._lbl_personality.setMinimumHeight(80)
+        self._lbl_personality.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+        )
+        self._lbl_personality.setWordWrap(True)
+        self._lbl_personality.setStyleSheet(
+            "font-size: 9pt;"
+            "padding: 4px;"
+            "background: rgba(128,128,128,0.08);"
+            "border: 1px solid rgba(128,128,128,0.25);"
+            "border-radius: 4px;"
+        )
+        right_col.addWidget(self._lbl_personality)
+
         right_col.addStretch()
 
         # Populate list
@@ -505,6 +541,36 @@ class LauncherWindow(QWidget):
             return None
         return item.text(), Path(item.data(Qt.ItemDataRole.UserRole))
 
+    def _personality_info(self, sprite_dir: Path) -> str:
+        """Return a short debug string about the character's personality file."""
+        char_name = sprite_dir.name.lower()
+        custom = self._PersonalitiesDir / f"{char_name}.txt"
+        default = self._PersonalitiesDir / "default.txt"
+
+        if custom.exists():
+            status = f"✓ {char_name}.txt"
+            text = custom.read_text()
+        elif default.exists():
+            status = f"✗ using default"
+            text = default.read_text()
+        else:
+            return "✗ no personality file"
+
+        favor = ""
+        for line in text.splitlines():
+            low = line.lower()
+            if "favor" in low and "emoji" in low:
+                # Extract everything after the colon
+                idx = line.find(":")
+                if idx != -1:
+                    favor = line[idx + 1:].strip()
+                break
+
+        result = status
+        if favor:
+            result += f"\n{favor}"
+        return result
+
     def _running_for(self, sprite_dir: Path) -> list:
         """Mascots whose sprite directory matches sprite_dir (includes clones)."""
         return [m for m in self._Mascot._all if m._sprites._dir == sprite_dir]
@@ -526,6 +592,7 @@ class LauncherWindow(QWidget):
             (self._act_throw,       self._Mascot._win_throw_on),
             (self._act_aware_same,  self._Mascot._aware_same),
             (self._act_aware_other, self._Mascot._aware_other),
+            (self._act_llm,         self._Mascot._llm_enabled),
         ):
             act.blockSignals(True)
             act.setChecked(value)
@@ -538,6 +605,7 @@ class LauncherWindow(QWidget):
             self._preview.clear()
             self._lbl_char.setText("—")
             self._lbl_count.setText("0 running")
+            self._lbl_personality.setText("")
             return
 
         name, sprite_dir = sel
@@ -557,6 +625,7 @@ class LauncherWindow(QWidget):
         self._lbl_count.setText(
             f"{running} running" if running != 1 else "1 running"
         )
+        self._lbl_personality.setText(self._personality_info(sprite_dir))
 
     # ── Launch / kill ─────────────────────────────────────────────────────────
 
@@ -641,12 +710,17 @@ class LauncherWindow(QWidget):
         self._Mascot._aware_other = checked
         self._save_settings()
 
+    def _toggle_llm(self, checked: bool):
+        self._Mascot._llm_enabled = checked
+        self._save_settings()
+
     def _save_settings(self):
         save_settings({
             "cloning_on":   self._Mascot._cloning_on,
             "win_throw_on": self._Mascot._win_throw_on,
             "aware_same":   self._Mascot._aware_same,
             "aware_other":  self._Mascot._aware_other,
+            "llm_enabled":  self._Mascot._llm_enabled,
         })
 
     # ── Import helpers ────────────────────────────────────────────────────────

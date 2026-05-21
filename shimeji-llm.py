@@ -11,8 +11,15 @@ Controls:
 import sys
 import math
 import random
+import queue
+import threading
+import json
+import urllib.request
+import unicodedata
 from pathlib import Path
 from enum import Enum, auto
+from collections import deque
+from dataclasses import dataclass
 
 from PySide6.QtCore import Qt, QTimer, QPoint, QRect, QObject
 from PySide6.QtGui import QPixmap, QPainter, QTransform, QCursor, QFont, QColor, QPen, QBrush, QPolygon
@@ -50,16 +57,151 @@ CHAT_DIST     = 160    # max anchor distance to start a conversation
 BUBBLE_MS     = 1600   # ms each speech bubble is visible
 BUBBLE_GAP_MS = 300    # ms pause between turns
 
-CHAT_EMOJIS: list[str] = [
-    # Expressions
-    "😁", "😄", "😮", "😅", "🤔", "😤", "😳", "🥺", "😏", "🤩",
-    "😴", "💤", "😜", "🤗", "😬", "😶", "🙄", "😑",
-    # Food
-    "🍕", "🍜", "🍩", "🍪", "☕", "🍵", "🍎", "🍓", "🍦",
-    # Reactions / objects
-    "👀", "👋", "👍", "👏", "❤️", "💔", "💭", "❓", "❗", "✨",
-    "⭐", "🌙", "☀️", "🌸", "🎵", "🎶", "🔥", "💥", "💫",
+# All named codepoints in the standard emoji unicode ranges.
+_EMOJI_RANGES = [
+    (0x1F600, 0x1F64F),   # Emoticons
+    (0x1F300, 0x1F5FF),   # Misc symbols & pictographs
+    (0x1F680, 0x1F6FF),   # Transport & map
+    (0x1F900, 0x1F9FF),   # Supplemental symbols & pictographs
+    (0x1FA70, 0x1FAFF),   # Symbols & pictographs extended-A
+    (0x2600,  0x26FF),    # Misc symbols
+    (0x2700,  0x27BF),    # Dingbats
 ]
+CHAT_EMOJIS: list[str] = [
+    chr(cp)
+    for start, end in _EMOJI_RANGES
+    for cp in range(start, end + 1)
+    if unicodedata.name(chr(cp), "")
+]
+
+# ── LLM settings ─────────────────────────────────────────────────────────────
+
+LLM_MODEL         = "qwen2.5:1.5b"        # ollama model tag
+HOST_IP           = "192.168.0.161"
+LLM_ENDPOINT      = f"http://{HOST_IP}:11434/api/chat"
+PERSONALITIES_DIR = Path(__file__).parent / "personalities"
+
+# ── LLM memory + personality helpers ─────────────────────────────────────────
+
+@dataclass
+class MemoryEvent:
+    role:    str   # "said" | "heard" | "partner_action" | "location"
+    content: str
+    partner: str = ""
+
+
+class MemoryBuffer:
+    def __init__(self):
+        self._events: deque[MemoryEvent] = deque(maxlen=10)
+
+    def record(self, role: str, content: str, partner: str = ""):
+        self._events.append(MemoryEvent(role, content, partner))
+
+    def to_text(self) -> str:
+        if not self._events:
+            return "(no memory yet)"
+        lines = []
+        for ev in self._events:
+            if ev.role == "said":
+                lines.append(f"I said: {ev.content}")
+            elif ev.role == "heard":
+                lines.append(f"Heard {ev.content} from {ev.partner}")
+            elif ev.role == "partner_action":
+                lines.append(f"Partner was: {ev.content}")
+            elif ev.role == "location":
+                lines.append(f"I was at: {ev.content}")
+        return "\n".join(lines)
+
+
+def get_personality(sprite_dir: Path) -> str:
+    char_name = sprite_dir.name.lower()
+    p = PERSONALITIES_DIR / f"{char_name}.txt"
+    if not p.exists():
+        p = PERSONALITIES_DIR / "default.txt"
+    try:
+        return p.read_text().strip()
+    except Exception:
+        return "You are a Shimeji desktop mascot. Reply ONLY with 1-3 emojis."
+
+
+def _location_str(mascot: "Mascot") -> str:
+    if mascot._state in (State.CEIL_CLING, State.CEIL_WALK):
+        return "ceiling"
+    if mascot._state in (State.WALL_CLING, State.WALL_CLIMB):
+        return "wall"
+    if Mascot._valid_win:
+        for w in Mascot._valid_win:
+            if abs(mascot._ay - w.rect.top()) < 12:
+                return f"top of '{w.name}'"
+    return "floor"
+
+
+class LLMController:
+    """
+    Singleton that dispatches ollama API calls on a background thread and
+    delivers results back to the Qt main thread via a polled result queue.
+    """
+    _instance: "LLMController | None" = None
+
+    @classmethod
+    def get(cls) -> "LLMController":
+        if cls._instance is None:
+            cls._instance = LLMController()
+        return cls._instance
+
+    def __init__(self):
+        self._req_q:    queue.Queue = queue.Queue()
+        self._res_q:    queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+        self._poll = QTimer()
+        self._poll.timeout.connect(self._drain)
+        self._poll.start(100)
+
+    def request(self, personality: str, memory_text: str,
+                partner_name: str, partner_last_emoji: str, callback):
+        self._req_q.put((personality, memory_text, partner_name,
+                          partner_last_emoji, callback))
+
+    def _worker(self):
+        while True:
+            personality, memory_text, partner_name, partner_last, cb = self._req_q.get()
+            try:
+                result = self._call_ollama(personality, memory_text,
+                                           partner_name, partner_last)
+            except Exception:
+                result = None
+            self._res_q.put((cb, result))
+
+    def _call_ollama(self, personality: str, memory_text: str,
+                     partner_name: str, partner_last: str) -> str | None:
+        prompt = (
+            f"[Recent memory]\n{memory_text}\n\n"
+            f"[Situation]\n"
+            f"Your conversation partner ({partner_name}) just said: {partner_last}\n"
+            "Respond in character. Reply ONLY with 1-3 emojis separated by spaces, nothing else."
+        )
+        body = json.dumps({
+            "model":    LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": personality},
+                {"role": "user",   "content": prompt},
+            ],
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            LLM_ENDPOINT, data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read())
+        return data["message"]["content"].strip() or None
+
+    def _drain(self):
+        while not self._res_q.empty():
+            cb, result = self._res_q.get_nowait()
+            cb(result)
+
 
 # ── Animation sequences ───────────────────────────────────────────────────────
 
@@ -432,6 +574,7 @@ class Mascot(QWidget):
     _keep_alive:   bool           = False  # set True by launcher to prevent app quit
     _class_screen: "QRect | None" = None   # set by main(); launcher uses per-instance screen
     _valid_win:    "list | None"  = None   # populated each tick by _valid_windows()
+    _llm_enabled:  bool           = False  # enable ollama LLM for conversations
 
     def __init__(
         self,
@@ -491,6 +634,7 @@ class Mascot(QWidget):
         self._state_ticks   = 0
         self._social_target:  "Mascot | None"        = None
         self._conversation:   "Conversation | None"  = None
+        self._memory:         MemoryBuffer            = MemoryBuffer()
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint    |
@@ -1876,6 +2020,8 @@ class Conversation(QObject):
     """
     Manages a 3-5 turn emoji exchange between two mascots.
     Uses a single-shot QTimer to drive alternating turns.
+    When Mascot._llm_enabled, uses LLMController to generate emoji responses;
+    a "💭" thinking bubble is shown while the LLM processes.
     Either mascot can call abort() to cancel early (e.g. on dismiss).
     """
 
@@ -1887,6 +2033,7 @@ class Conversation(QObject):
         self._whose      = 0          # 0 = initiator's turn, 1 = responder's
         self._aborted    = False
         self._bubble: SpeechBubble | None = None
+        self._last_emoji: dict[int, str]  = {}   # id(mascot) → last emoji said
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._advance)
@@ -1898,14 +2045,45 @@ class Conversation(QObject):
     def _speaker(self) -> "Mascot":
         return self._a if self._whose == 0 else self._b
 
+    def _listener(self) -> "Mascot":
+        return self._b if self._whose == 0 else self._a
+
     def _do_turn(self):
         if self._aborted:
             return
-        speaker = self._speaker()
+        speaker  = self._speaker()
+        listener = self._listener()
         if speaker not in Mascot._all:
             self.abort()
             return
-        self._bubble = SpeechBubble(speaker, self._pick_emoji(), BUBBLE_MS)
+
+        if Mascot._llm_enabled:
+            personality  = get_personality(speaker._sprites._dir)
+            memory_text  = speaker._memory.to_text()
+            partner_name = listener._sprites._dir.name
+            partner_last = self._last_emoji.get(id(listener), "")
+            LLMController.get().request(
+                personality, memory_text, partner_name, partner_last,
+                lambda emoji, sp=speaker, li=listener: self._on_llm_ready(emoji, sp, li),
+            )
+        else:
+            self._deliver(speaker, listener, self._pick_emoji())
+
+    def _on_llm_ready(self, emoji: str | None, speaker: "Mascot", listener: "Mascot"):
+        if self._aborted:
+            return
+        self._deliver(speaker, listener, emoji or self._pick_emoji())
+
+    def _deliver(self, speaker: "Mascot", listener: "Mascot", emoji: str):
+        """Show the speech bubble and record the turn in both mascots' memories."""
+        speaker._memory.record("said",           emoji)
+        speaker._memory.record("location",       _location_str(speaker))
+        listener._memory.record("heard",         emoji, speaker._sprites._dir.name)
+        listener._memory.record("partner_action", speaker._state.name.lower())
+        self._last_emoji[id(speaker)] = emoji
+        if self._bubble and not self._bubble.isHidden():
+            self._bubble.close()
+        self._bubble = SpeechBubble(speaker, emoji, BUBBLE_MS)
         self._timer.start(BUBBLE_MS + BUBBLE_GAP_MS)
 
     def _advance(self):
