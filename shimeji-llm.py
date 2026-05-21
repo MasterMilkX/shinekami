@@ -173,13 +173,30 @@ class LLMController:
                 result = None
             self._res_q.put((cb, result))
 
+    @staticmethod
+    def _extract_favor(personality: str) -> str:
+        """Pull the favored emoji string from a personality file, if present."""
+        for line in personality.splitlines():
+            low = line.lower()
+            if "favor" in low and "emoji" in low:
+                idx = line.find(":")
+                if idx != -1:
+                    return line[idx + 1:].strip()
+        return ""
+
     def _call_ollama(self, personality: str, memory_text: str,
                      partner_name: str, partner_last: str) -> str | None:
+        favor = self._extract_favor(personality)
+        favor_line = (
+            f"\nYou strongly prefer these emojis: {favor}"
+            if favor else ""
+        )
         prompt = (
             f"[Recent memory]\n{memory_text}\n\n"
             f"[Situation]\n"
             f"Your conversation partner ({partner_name}) just said: {partner_last}\n"
-            "Respond in character. Reply ONLY with 1-3 emojis separated by spaces, nothing else."
+            f"Respond in character.{favor_line}"
+            " Reply ONLY with 1-3 emojis separated by spaces, nothing else."
         )
         body = json.dumps({
             "model":    LLM_MODEL,
