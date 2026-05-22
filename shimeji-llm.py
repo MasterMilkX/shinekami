@@ -221,7 +221,7 @@ class LLMController:
             f"[Recent memory]\n{memory_text}\n\n"
             f"[Situation]\n"
             f"Your conversation partner ({partner_name}) just said: {partner_last}\n"
-            f"Respond in character.{favor_line}"
+            # f"Respond in character.{favor_line}"
             " Reply ONLY with 1-3 emojis separated by spaces, nothing else."
         )
         body = json.dumps({
