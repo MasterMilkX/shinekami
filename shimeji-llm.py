@@ -17,6 +17,7 @@ import json
 import time
 import urllib.request
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from enum import Enum, auto
 from collections import deque
@@ -42,7 +43,7 @@ CEIL_SPEED    = 1.5      # px / tick on ceiling
 FLOOR_MARGIN  = 6
 WEIGHT        = 1.0      # future: throw mass scaling
 
-MAX_MASCOTS   = 5
+MAX_MASCOTS   = 8
 MERGE_DIST    = 60       # px anchor-to-anchor before merge roll
 WIN_THROW_VX  = 28.0    # px / tick for thrown windows
 
@@ -58,7 +59,7 @@ CHAT_DIST     = 160    # max anchor distance to start a conversation
 BUBBLE_MS     = 1600   # ms each speech bubble is visible
 BUBBLE_GAP_MS = 300    # ms pause between turns
 
-SHOW_LLM_RES = True
+SHOW_LLM_RES = False
 
 # All named codepoints in the standard emoji unicode ranges.
 _EMOJI_RANGES = [
@@ -83,6 +84,24 @@ LLM_MODEL         = "qwen2.5:1.5b"        # ollama model tag
 HOST_IP           = "192.168.0.161"
 LLM_ENDPOINT      = f"http://{HOST_IP}:11434/api/chat"
 PERSONALITIES_DIR = Path(__file__).parent / "personalities"
+CHAT_LOG_DIR      = Path(__file__).parent / "logs"
+
+# ── Chat logging ──────────────────────────────────────────────────────────────
+
+def _log_chat(speaker_name: str, listener_name: str, emoji: str, source: str):
+    """
+    Append one chat line to logs/chat_YYYY-MM-DD.log.
+    source is "llm" or "random".
+    """
+    try:
+        CHAT_LOG_DIR.mkdir(exist_ok=True)
+        log_file = CHAT_LOG_DIR / f"chat_{datetime.now().strftime('%Y-%m-%d')}.log"
+        ts   = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] ({source:>6}) {speaker_name} → {listener_name}: {emoji}\n"
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as exc:
+        print(f"[LOG] failed to write chat log: {exc}", flush=True)
 
 # ── LLM memory + personality helpers ─────────────────────────────────────────
 
@@ -2111,20 +2130,29 @@ class Conversation(QObject):
                 lambda emoji, sp=speaker, li=listener: self._on_llm_ready(emoji, sp, li),
             )
         else:
-            self._deliver(speaker, listener, self._pick_emoji())
+            self._deliver(speaker, listener, self._pick_emoji(), source="random")
 
     def _on_llm_ready(self, emoji: str | None, speaker: "Mascot", listener: "Mascot"):
         if self._aborted:
             return
-        self._deliver(speaker, listener, emoji or self._pick_emoji())
+        if emoji:
+            self._deliver(speaker, listener, emoji, source="llm")
+        else:
+            self._deliver(speaker, listener, self._pick_emoji(), source="random")
 
-    def _deliver(self, speaker: "Mascot", listener: "Mascot", emoji: str):
-        """Show the speech bubble and record the turn in both mascots' memories."""
-        speaker._memory.record("said",           emoji)
-        speaker._memory.record("location",       _location_str(speaker))
-        listener._memory.record("heard",         emoji, speaker._sprites._dir.name)
+    def _deliver(self, speaker: "Mascot", listener: "Mascot", emoji: str, source: str = "random"):
+        """Show the speech bubble, record the turn in memories, and log to file."""
+        speaker_name  = speaker._sprites._dir.name
+        listener_name = listener._sprites._dir.name
+
+        speaker._memory.record("said",            emoji)
+        speaker._memory.record("location",        _location_str(speaker))
+        listener._memory.record("heard",          emoji, speaker_name)
         listener._memory.record("partner_action", speaker._state.name.lower())
         self._last_emoji[id(speaker)] = emoji
+
+        _log_chat(speaker_name, listener_name, emoji, source)
+
         if self._bubble and not self._bubble.isHidden():
             self._bubble.close()
         self._bubble = SpeechBubble(speaker, emoji, BUBBLE_MS)
