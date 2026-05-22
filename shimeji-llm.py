@@ -58,7 +58,7 @@ CHAT_DIST     = 160    # max anchor distance to start a conversation
 BUBBLE_MS     = 1600   # ms each speech bubble is visible
 BUBBLE_GAP_MS = 300    # ms pause between turns
 
-SHOW_LLM_RESP = False
+SHOW_LLM_RES = True
 
 # All named codepoints in the standard emoji unicode ranges.
 _EMOJI_RANGES = [
@@ -182,9 +182,10 @@ class LLMController:
             try:
                 result = self._call_ollama(personality, memory_text,
                                            partner_name, partner_last)
+                short_chat = ''.join([str(r) for r in result if r in CHAT_EMOJIS])[:7]
                 elapsed = (time.monotonic() - t0) * 1000
                 LLMController.total_ok      += 1
-                LLMController.last_emoji     = result or ""
+                LLMController.last_emoji     = short_chat or ""
                 LLMController.last_error     = ""
                 LLMController.last_elapsed_ms = elapsed
                 if SHOW_LLM_RES:
@@ -196,7 +197,7 @@ class LLMController:
                 LLMController.last_elapsed_ms = elapsed
                 result = None
                 print(f"[LLM] ✗ {elapsed:.0f}ms — {exc}", flush=True)
-            self._res_q.put((cb, result))
+            self._res_q.put((cb, short_chat))
 
     @staticmethod
     def _extract_favor(personality: str) -> str:
@@ -213,7 +214,7 @@ class LLMController:
                      partner_name: str, partner_last: str) -> str | None:
         favor = self._extract_favor(personality)
         favor_line = (
-            f"\nYou strongly prefer these emojis: {favor}. Use them where you can and as appropriate to be as in character as possible."
+            f"\nYou strongly prefer these emojis: {favor}. Use them where you can and as appropriate to be as in character as possible. Use 1-3 emojis total at a time."
             if favor else ""
         )
         prompt = (
@@ -238,7 +239,7 @@ class LLMController:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read())
 
-        return data["message"]["content"].strip()[:5] or None
+        return data["message"]["content"].strip() or None
 
     def _drain(self):
         while not self._res_q.empty():
