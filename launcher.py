@@ -319,6 +319,7 @@ class LauncherWindow(QWidget):
         self._DebugPanel      = DebugPanel
         self._spawn           = _spawn
         self._PersonalitiesDir = _mod.PERSONALITIES_DIR
+        self._mod = _mod
 
         # Tell mascots not to quit the app when the last one is dismissed.
         Mascot._keep_alive = True
@@ -896,9 +897,11 @@ class LauncherWindow(QWidget):
     # ── Window events ─────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
-        """Closing the launcher kills all mascots and exits the app."""
+        """Closing the launcher saves memories then kills all mascots and exits."""
         for m in list(self._Mascot._all):
             m._timer.stop()
+            self._mod.summarize_memory_async(m._sprites._dir.name, m._memory)
+            self._mod.save_memory(m._sprites._dir.name, m._memory)
             m.close()
         self._Mascot._all.clear()
         self._Mascot._keep_alive = False

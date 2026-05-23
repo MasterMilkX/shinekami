@@ -85,6 +85,8 @@ HOST_IP           = "192.168.0.161"
 LLM_ENDPOINT      = f"http://{HOST_IP}:11434/api/chat"
 PERSONALITIES_DIR = Path(__file__).parent / "personalities"
 CHAT_LOG_DIR      = Path(__file__).parent / "logs"
+MEMORY_DIR        = Path(__file__).parent / "memory"
+TRAINING_DIR      = Path(__file__).parent / "logs" / "training"
 
 # ── Chat logging ──────────────────────────────────────────────────────────────
 
@@ -111,18 +113,57 @@ class MemoryEvent:
     content: str
     partner: str = ""
 
+    def to_dict(self) -> dict:
+        return {"role": self.role, "content": self.content, "partner": self.partner}
+
+    @staticmethod
+    def from_dict(d: dict) -> "MemoryEvent":
+        return MemoryEvent(d["role"], d["content"], d.get("partner", ""))
+
+    def to_fragment(self) -> str:
+        """Emoji-only fragment used when this event is evicted into the summary.
+        Only chat events (said/heard) contribute — location/action are skipped
+        to keep the summary compact and purely emoji-based."""
+        if self.role in ("said", "heard"):
+            return self.content   # already emoji
+        return ""                 # location / partner_action → discard
+
 
 class MemoryBuffer:
+    RECENT_MAX = 10
+
     def __init__(self):
-        self._events: deque[MemoryEvent] = deque(maxlen=10)
+        self._events:               deque[MemoryEvent] = deque(maxlen=self.RECENT_MAX)
+        self._summary:              str                = ""
+        self._events_since_summary: int                = 0
+
+    SUMMARY_MAX        = 100   # hard cap on summary string length
+    SUMMARIZE_EVERY    = 10    # trigger LLM summarization after this many chat events
 
     def record(self, role: str, content: str, partner: str = ""):
+        # Before appending, absorb the event that is about to be evicted.
+        if len(self._events) == self._events.maxlen:
+            frag = self._events[0].to_fragment()
+            if frag:
+                combined = self._summary + frag
+                # Trim oldest characters if over the cap
+                if len(combined) > self.SUMMARY_MAX:
+                    combined = combined[-self.SUMMARY_MAX:]
+                self._summary = combined
         self._events.append(MemoryEvent(role, content, partner))
+        if role in ("said", "heard"):
+            self._events_since_summary += 1
+
+    def needs_summarization(self) -> bool:
+        return self._events_since_summary >= self.SUMMARIZE_EVERY
+
+    def reset_summary_counter(self):
+        self._events_since_summary = 0
 
     def to_text(self) -> str:
-        if not self._events:
-            return "(no memory yet)"
         lines = []
+        if self._summary:
+            lines.append(f"[Earlier] {self._summary}")
         for ev in self._events:
             if ev.role == "said":
                 lines.append(f"I said: {ev.content}")
@@ -132,7 +173,122 @@ class MemoryBuffer:
                 lines.append(f"Partner was: {ev.content}")
             elif ev.role == "location":
                 lines.append(f"I was at: {ev.content}")
-        return "\n".join(lines)
+        return "\n".join(lines) if lines else "(no memory yet)"
+
+    def to_dict(self) -> dict:
+        return {
+            "summary":               self._summary,
+            "events_since_summary":  self._events_since_summary,
+            "events":                [e.to_dict() for e in self._events],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MemoryBuffer":
+        buf = cls()
+        buf._summary              = d.get("summary", "")
+        buf._events_since_summary = d.get("events_since_summary", 0)
+        for ev_d in d.get("events", []):
+            buf._events.append(MemoryEvent.from_dict(ev_d))
+        return buf
+
+
+# ── Memory persistence ────────────────────────────────────────────────────────
+
+def save_memory(char_name: str, memory: MemoryBuffer):
+    """Write a character's memory buffer to memory/<char_name>.json."""
+    try:
+        MEMORY_DIR.mkdir(exist_ok=True)
+        path = MEMORY_DIR / f"{char_name}.json"
+        data = {
+            "character":  char_name,
+            "saved_at":   datetime.now().isoformat(timespec="seconds"),
+            "memory":     memory.to_dict(),
+        }
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception as exc:
+        print(f"[MEM] failed to save memory for {char_name}: {exc}", flush=True)
+
+
+def load_memory(char_name: str) -> MemoryBuffer:
+    """Load a character's memory buffer from disk, or return a fresh one."""
+    path = MEMORY_DIR / f"{char_name}.json"
+    try:
+        data = json.loads(path.read_text())
+        buf  = MemoryBuffer.from_dict(data["memory"])
+        print(f"[MEM] loaded memory for {char_name} "
+              f"({len(buf._events)} events, summary={bool(buf._summary)})", flush=True)
+        return buf
+    except FileNotFoundError:
+        return MemoryBuffer()
+    except Exception as exc:
+        print(f"[MEM] failed to load memory for {char_name}: {exc}", flush=True)
+        return MemoryBuffer()
+
+
+# ── Training data export ──────────────────────────────────────────────────────
+
+def _export_training_example(
+    speaker_name:  str,
+    listener_name: str,
+    state:         str,
+    location:      str,
+    memory:        MemoryBuffer,
+    partner_last:  str,
+    emoji_output:  str,
+    source:        str,
+):
+    """
+    Append one JSONL training record to logs/training/<char_name>.jsonl.
+    Each record captures the full input context and the model's output so it
+    can be used directly as a finetuning example for Gemma or similar models.
+    """
+    try:
+        TRAINING_DIR.mkdir(parents=True, exist_ok=True)
+        path = TRAINING_DIR / f"{speaker_name}.jsonl"
+        record = {
+            "timestamp":    datetime.now().isoformat(timespec="seconds"),
+            "character":    speaker_name,
+            "partner":      listener_name,
+            "input": {
+                "state":          state,
+                "location":       location,
+                "memory_summary": memory._summary,
+                "recent_events":  [e.to_dict() for e in memory._events],
+                "partner_last_said": partner_last,
+            },
+            "output": {
+                "type":   "chat",
+                "emoji":  emoji_output,
+                "source": source,
+            },
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[TRAIN] failed to write training data: {exc}", flush=True)
+
+
+def summarize_memory_async(char_name: str, memory: MemoryBuffer):
+    """
+    Fire an async LLM request to compress the full memory into a fresh
+    ≤100-char emoji summary.  No-op when LLM is disabled or memory is empty.
+    Triggered after every SUMMARIZE_EVERY chat events and on dismiss.
+    The result is written back into memory._summary and saved to disk.
+    """
+    if not Mascot._llm_enabled:
+        return
+    text = memory.to_text()
+    if not text or text == "(no memory yet)":
+        return
+    memory.reset_summary_counter()
+
+    def _on_result(emoji_summary: str | None):
+        if emoji_summary:
+            memory._summary = emoji_summary[:100]
+            print(f"[MEM] summarized {char_name}: {memory._summary!r}", flush=True)
+            save_memory(char_name, memory)
+
+    LLMController.get().request_summary(text, _on_result)
 
 
 def get_personality(sprite_dir: Path) -> str:
@@ -143,7 +299,7 @@ def get_personality(sprite_dir: Path) -> str:
     try:
         return p.read_text().strip()
     except Exception:
-        return "You are a Shimeji desktop mascot. Reply ONLY with 1-3 emojis."
+        return "You are a Shimeji desktop mascot. Reply ONLY with 1-4 emojis."
 
 
 def _location_str(mascot: "Mascot") -> str:
@@ -191,32 +347,45 @@ class LLMController:
     def request(self, personality: str, memory_text: str,
                 partner_name: str, partner_last_emoji: str, callback):
         LLMController.total_requests += 1
-        self._req_q.put((personality, memory_text, partner_name,
+        self._req_q.put(("chat", personality, memory_text, partner_name,
                           partner_last_emoji, callback))
+
+    def request_summary(self, memory_text: str, callback):
+        """Queue an async memory-compression request."""
+        self._req_q.put(("summary", memory_text, callback))
 
     def _worker(self):
         while True:
-            personality, memory_text, partner_name, partner_last, cb = self._req_q.get()
-            t0 = time.monotonic()
+            item = self._req_q.get()
+            t0   = time.monotonic()
+            cb   = item[-1]
             try:
-                result = self._call_ollama(personality, memory_text,
-                                           partner_name, partner_last)
-                short_chat = ''.join([str(r) for r in result if r in CHAT_EMOJIS])[:7]
-                elapsed = (time.monotonic() - t0) * 1000
-                LLMController.total_ok      += 1
-                LLMController.last_emoji     = short_chat or ""
-                LLMController.last_error     = ""
-                LLMController.last_elapsed_ms = elapsed
-                if SHOW_LLM_RES:
-                    print(f"[LLM] ✓ {elapsed:.0f}ms → {result!r}", flush=True)
+                if item[0] == "chat":
+                    _, personality, memory_text, partner_name, partner_last, _ = item
+                    result  = self._call_ollama(personality, memory_text,
+                                                partner_name, partner_last)
+                    result = "".join([str(x) for x in result if str(x) in CHAT_EMOJIS])
+                    elapsed = (time.monotonic() - t0) * 1000
+                    LLMController.total_ok       += 1
+                    LLMController.last_emoji      = (result or "")[:8]
+                    LLMController.last_error      = ""
+                    LLMController.last_elapsed_ms = elapsed
+                    # print(f"[LLM] chat ✓ {elapsed:.0f}ms → {result!r}", flush=True)
+                elif item[0] == "summary":
+                    _, memory_text, _ = item
+                    result  = self._call_ollama_summary(memory_text)
+                    elapsed = (time.monotonic() - t0) * 1000
+                    print(f"[LLM] summary ✓ {elapsed:.0f}ms → {result!r}", flush=True)
+                else:
+                    result = None
             except Exception as exc:
                 elapsed = (time.monotonic() - t0) * 1000
-                LLMController.total_errors  += 1
-                LLMController.last_error     = str(exc)
+                LLMController.total_errors   += 1
+                LLMController.last_error      = str(exc)
                 LLMController.last_elapsed_ms = elapsed
                 result = None
                 print(f"[LLM] ✗ {elapsed:.0f}ms — {exc}", flush=True)
-            self._res_q.put((cb, short_chat))
+            self._res_q.put((cb, result))
 
     @staticmethod
     def _extract_favor(personality: str) -> str:
@@ -229,19 +398,22 @@ class LLMController:
                     return line[idx + 1:].strip()
         return ""
 
+    # Hard token cap for chat responses — 4 emojis ≈ 12–16 tokens, 20 is safe headroom
+    CHAT_MAX_TOKENS = 20
+
     def _call_ollama(self, personality: str, memory_text: str,
                      partner_name: str, partner_last: str) -> str | None:
         favor = self._extract_favor(personality)
         favor_line = (
-            f"\nYou strongly prefer these emojis: {favor}. Use them where you can and as appropriate to be as in character as possible. Use 1-3 emojis total at a time."
+            f"\nPrefer these emojis when fitting: {favor}."
             if favor else ""
         )
         prompt = (
             f"[Recent memory]\n{memory_text}\n\n"
             f"[Situation]\n"
             f"Your conversation partner ({partner_name}) just said: {partner_last}\n"
-            # f"Respond in character.{favor_line}"
-            " Reply ONLY with 1-3 emojis separated by spaces, nothing else."
+            f"Respond in character.{favor_line}"
+            " Reply with ONLY 1-3 emojis. No words, no punctuation, emojis only."
         )
         body = json.dumps({
             "model":    LLM_MODEL,
@@ -249,6 +421,7 @@ class LLMController:
                 {"role": "system", "content": personality},
                 {"role": "user",   "content": prompt},
             ],
+            "options": {"num_predict": self.CHAT_MAX_TOKENS},
             "stream": False,
         }).encode()
         req = urllib.request.Request(
@@ -259,6 +432,34 @@ class LLMController:
             data = json.loads(resp.read())
 
         return data["message"]["content"].strip() or None
+
+    def _call_ollama_summary(self, memory_text: str) -> str | None:
+        """Ask the LLM to compress a full memory block into ≤100 emoji chars."""
+        prompt = (
+            "Compress the following conversation memory into a single sequence of "
+            "emojis (maximum 100 characters, no spaces or text). "
+            "Use emojis to represent emotions, actions, and topics. "
+            "Output ONLY emojis, nothing else.\n\n"
+            f"{memory_text}"
+        )
+        body = json.dumps({
+            "model":    LLM_MODEL,
+            "messages": [
+                {"role": "system",
+                 "content": "You compress conversation histories into emoji sequences. "
+                             "Output ONLY emojis, no text, no spaces, max 100 characters."},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            LLM_ENDPOINT, data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read())
+        raw = data["message"]["content"].strip()
+        return raw[:100] if raw else None
 
     def _drain(self):
         while not self._res_q.empty():
@@ -697,7 +898,7 @@ class Mascot(QWidget):
         self._state_ticks   = 0
         self._social_target:  "Mascot | None"        = None
         self._conversation:   "Conversation | None"  = None
-        self._memory:         MemoryBuffer            = MemoryBuffer()
+        self._memory:         MemoryBuffer            = load_memory(sprites._dir.name)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint    |
@@ -1984,6 +2185,9 @@ class Mascot(QWidget):
     def _dismiss(self):
         if self._conversation is not None:
             self._conversation.abort()
+        char_name = self._sprites._dir.name
+        summarize_memory_async(char_name, self._memory)   # best-effort async
+        save_memory(char_name, self._memory)
         self._timer.stop()
         self.close()
         if self in Mascot._all:
@@ -2132,24 +2336,47 @@ class Conversation(QObject):
         else:
             self._deliver(speaker, listener, self._pick_emoji(), source="random")
 
+    # Maximum characters shown in a speech bubble (prevents overflow)
+    BUBBLE_MAX_CHARS = 8
+
     def _on_llm_ready(self, emoji: str | None, speaker: "Mascot", listener: "Mascot"):
         if self._aborted:
             return
         if emoji:
+            emoji = emoji[:self.BUBBLE_MAX_CHARS]
             self._deliver(speaker, listener, emoji, source="llm")
         else:
             self._deliver(speaker, listener, self._pick_emoji(), source="random")
 
     def _deliver(self, speaker: "Mascot", listener: "Mascot", emoji: str, source: str = "random"):
-        """Show the speech bubble, record the turn in memories, and log to file."""
+        """Show the speech bubble, record the turn in memories, log, and export training data."""
         speaker_name  = speaker._sprites._dir.name
         listener_name = listener._sprites._dir.name
+        partner_last  = self._last_emoji.get(id(listener), "")
+
+        # Export training record BEFORE recording this turn so memory reflects
+        # the state the model actually saw when it produced this response.
+        _export_training_example(
+            speaker_name  = speaker_name,
+            listener_name = listener_name,
+            state         = speaker._state.name,
+            location      = _location_str(speaker),
+            memory        = speaker._memory,
+            partner_last  = partner_last,
+            emoji_output  = emoji,
+            source        = source,
+        )
 
         speaker._memory.record("said",            emoji)
         speaker._memory.record("location",        _location_str(speaker))
         listener._memory.record("heard",          emoji, speaker_name)
         listener._memory.record("partner_action", speaker._state.name.lower())
         self._last_emoji[id(speaker)] = emoji
+
+        # Trigger async LLM summarization after every SUMMARIZE_EVERY chat events
+        for m, name in ((speaker, speaker_name), (listener, listener_name)):
+            if m._memory.needs_summarization():
+                summarize_memory_async(name, m._memory)
 
         _log_chat(speaker_name, listener_name, emoji, source)
 

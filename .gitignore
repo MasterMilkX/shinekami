@@ -9,3 +9,5 @@ SHIMEJI-TEMPLATE/.*
 characters/*
 groups.json
 personalities/*
+logs/*
+memory/*
