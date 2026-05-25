@@ -13,6 +13,7 @@ import math
 import random
 import queue
 import threading
+import concurrent.futures
 import json
 import time
 import urllib.request
@@ -120,36 +121,19 @@ class MemoryEvent:
     def from_dict(d: dict) -> "MemoryEvent":
         return MemoryEvent(d["role"], d["content"], d.get("partner", ""))
 
-    def to_fragment(self) -> str:
-        """Emoji-only fragment used when this event is evicted into the summary.
-        Only chat events (said/heard) contribute — location/action are skipped
-        to keep the summary compact and purely emoji-based."""
-        if self.role in ("said", "heard"):
-            return self.content   # already emoji
-        return ""                 # location / partner_action → discard
-
-
 class MemoryBuffer:
-    RECENT_MAX = 10
+    RECENT_MAX      = 10    # raw events kept since last summary
+    SUMMARIES_MAX   = 10    # LLM-generated chapter summaries to retain
+    SUMMARY_MAX     = 100   # max characters per summary string
+    SUMMARIZE_EVERY = 10    # chat events before requesting a new LLM summary
 
     def __init__(self):
         self._events:               deque[MemoryEvent] = deque(maxlen=self.RECENT_MAX)
-        self._summary:              str                = ""
+        self._summaries:            deque[str]         = deque(maxlen=self.SUMMARIES_MAX)
+        self._meta_summary:         str                = ""
         self._events_since_summary: int                = 0
 
-    SUMMARY_MAX        = 100   # hard cap on summary string length
-    SUMMARIZE_EVERY    = 10    # trigger LLM summarization after this many chat events
-
     def record(self, role: str, content: str, partner: str = ""):
-        # Before appending, absorb the event that is about to be evicted.
-        if len(self._events) == self._events.maxlen:
-            frag = self._events[0].to_fragment()
-            if frag:
-                combined = self._summary + frag
-                # Trim oldest characters if over the cap
-                if len(combined) > self.SUMMARY_MAX:
-                    combined = combined[-self.SUMMARY_MAX:]
-                self._summary = combined
         self._events.append(MemoryEvent(role, content, partner))
         if role in ("said", "heard"):
             self._events_since_summary += 1
@@ -160,24 +144,42 @@ class MemoryBuffer:
     def reset_summary_counter(self):
         self._events_since_summary = 0
 
+    def push_summary(self, emoji_summary: str):
+        """Store a new LLM-generated chapter summary.
+        When the summaries deque is full, the oldest chapter is absorbed
+        into _meta_summary before being evicted."""
+        chapter = emoji_summary[:self.SUMMARY_MAX]
+        if len(self._summaries) == self._summaries.maxlen:
+            oldest   = self._summaries[0]
+            combined = self._meta_summary + oldest
+            self._meta_summary = combined[-self.SUMMARY_MAX:]
+        self._summaries.append(chapter)
+        self._events.clear()   # raw events are now captured in this chapter
+
     def to_text(self) -> str:
         lines = []
-        if self._summary:
-            lines.append(f"[Earlier] {self._summary}")
+        if self._meta_summary:
+            lines.append(f"[History] {self._meta_summary}")
+        if self._summaries:
+            lines.append(f"[Chapters] {'|'.join(self._summaries)}")
+        recent = []
         for ev in self._events:
             if ev.role == "said":
-                lines.append(f"I said: {ev.content}")
+                recent.append(f"I said: {ev.content}")
             elif ev.role == "heard":
-                lines.append(f"Heard {ev.content} from {ev.partner}")
+                recent.append(f"Heard {ev.content} from {ev.partner}")
             elif ev.role == "partner_action":
-                lines.append(f"Partner was: {ev.content}")
+                recent.append(f"Partner was: {ev.content}")
             elif ev.role == "location":
-                lines.append(f"I was at: {ev.content}")
+                recent.append(f"I was at: {ev.content}")
+        if recent:
+            lines.append(f"[Recent] {'; '.join(recent)}")
         return "\n".join(lines) if lines else "(no memory yet)"
 
     def to_dict(self) -> dict:
         return {
-            "summary":               self._summary,
+            "meta_summary":          self._meta_summary,
+            "summaries":             list(self._summaries),
             "events_since_summary":  self._events_since_summary,
             "events":                [e.to_dict() for e in self._events],
         }
@@ -185,8 +187,10 @@ class MemoryBuffer:
     @classmethod
     def from_dict(cls, d: dict) -> "MemoryBuffer":
         buf = cls()
-        buf._summary              = d.get("summary", "")
+        buf._meta_summary         = d.get("meta_summary", "")
         buf._events_since_summary = d.get("events_since_summary", 0)
+        for s in d.get("summaries", []):
+            buf._summaries.append(s)
         for ev_d in d.get("events", []):
             buf._events.append(MemoryEvent.from_dict(ev_d))
         return buf
@@ -216,7 +220,9 @@ def load_memory(char_name: str) -> MemoryBuffer:
         data = json.loads(path.read_text())
         buf  = MemoryBuffer.from_dict(data["memory"])
         print(f"[MEM] loaded memory for {char_name} "
-              f"({len(buf._events)} events, summary={bool(buf._summary)})", flush=True)
+              f"({len(buf._summaries)} chapters, "
+              f"{len(buf._events)} recent events, "
+              f"meta={bool(buf._meta_summary)})", flush=True)
         return buf
     except FileNotFoundError:
         return MemoryBuffer()
@@ -228,14 +234,14 @@ def load_memory(char_name: str) -> MemoryBuffer:
 # ── Training data export ──────────────────────────────────────────────────────
 
 def _export_training_example(
-    speaker_name:  str,
-    listener_name: str,
-    state:         str,
-    location:      str,
-    memory:        MemoryBuffer,
-    partner_last:  str,
-    emoji_output:  str,
-    source:        str,
+    speaker_name:   str,
+    listener_names: list[str],
+    state:          str,
+    location:       str,
+    memory:         MemoryBuffer,
+    partner_last:   str,
+    emoji_output:   str,
+    source:         str,
 ):
     """
     Append one JSONL training record to logs/training/<char_name>.jsonl.
@@ -248,12 +254,13 @@ def _export_training_example(
         record = {
             "timestamp":    datetime.now().isoformat(timespec="seconds"),
             "character":    speaker_name,
-            "partner":      listener_name,
+            "listeners":    listener_names,
             "input": {
-                "state":          state,
-                "location":       location,
-                "memory_summary": memory._summary,
-                "recent_events":  [e.to_dict() for e in memory._events],
+                "state":             state,
+                "location":          location,
+                "meta_summary":      memory._meta_summary,
+                "recent_summaries":  list(memory._summaries),
+                "recent_events":     [e.to_dict() for e in memory._events],
                 "partner_last_said": partner_last,
             },
             "output": {
@@ -270,10 +277,10 @@ def _export_training_example(
 
 def summarize_memory_async(char_name: str, memory: MemoryBuffer):
     """
-    Fire an async LLM request to compress the full memory into a fresh
-    ≤100-char emoji summary.  No-op when LLM is disabled or memory is empty.
+    Fire an async LLM request to compress the current memory snapshot into a
+    new ≤100-char emoji chapter summary.
     Triggered after every SUMMARIZE_EVERY chat events and on dismiss.
-    The result is written back into memory._summary and saved to disk.
+    The result is pushed into memory._summaries via push_summary() and saved.
     """
     if not Mascot._llm_enabled:
         return
@@ -284,8 +291,9 @@ def summarize_memory_async(char_name: str, memory: MemoryBuffer):
 
     def _on_result(emoji_summary: str | None):
         if emoji_summary:
-            memory._summary = emoji_summary[:100]
-            print(f"[MEM] summarized {char_name}: {memory._summary!r}", flush=True)
+            memory.push_summary(emoji_summary)
+            n = len(memory._summaries)
+            print(f"[MEM] chapter {n} for {char_name}: {emoji_summary!r}", flush=True)
             save_memory(char_name, memory)
 
     LLMController.get().request_summary(text, _on_result)
@@ -335,11 +343,17 @@ class LLMController:
             cls._instance = LLMController()
         return cls._instance
 
+    # Chat requests run concurrently (one per active conversation).
+    # Summaries get their own single-thread pool so they never block chat.
+    CHAT_WORKERS    = 4
+    SUMMARY_WORKERS = 1
+
     def __init__(self):
-        self._req_q:    queue.Queue = queue.Queue()
-        self._res_q:    queue.Queue = queue.Queue()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
+        self._res_q: queue.Queue = queue.Queue()
+        self._chat_pool    = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.CHAT_WORKERS,    thread_name_prefix="llm-chat")
+        self._summary_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.SUMMARY_WORKERS, thread_name_prefix="llm-summary")
         self._poll = QTimer()
         self._poll.timeout.connect(self._drain)
         self._poll.start(100)
@@ -347,45 +361,46 @@ class LLMController:
     def request(self, personality: str, memory_text: str,
                 partner_name: str, partner_last_emoji: str, callback):
         LLMController.total_requests += 1
-        self._req_q.put(("chat", personality, memory_text, partner_name,
-                          partner_last_emoji, callback))
+        t0 = time.monotonic()
+        future = self._chat_pool.submit(
+            self._call_ollama, personality, memory_text, partner_name, partner_last_emoji)
+        future.add_done_callback(
+            lambda f, cb=callback, start=t0: self._on_chat_done(f, cb, start))
 
     def request_summary(self, memory_text: str, callback):
-        """Queue an async memory-compression request."""
-        self._req_q.put(("summary", memory_text, callback))
+        """Submit an async memory-compression request on the summary pool."""
+        future = self._summary_pool.submit(self._call_ollama_summary, memory_text)
+        future.add_done_callback(
+            lambda f, cb=callback: self._on_summary_done(f, cb))
 
-    def _worker(self):
-        while True:
-            item = self._req_q.get()
-            t0   = time.monotonic()
-            cb   = item[-1]
-            try:
-                if item[0] == "chat":
-                    _, personality, memory_text, partner_name, partner_last, _ = item
-                    result  = self._call_ollama(personality, memory_text,
-                                                partner_name, partner_last)
-                    result = "".join([str(x) for x in result if str(x) in CHAT_EMOJIS])
-                    elapsed = (time.monotonic() - t0) * 1000
-                    LLMController.total_ok       += 1
-                    LLMController.last_emoji      = (result or "")[:8]
-                    LLMController.last_error      = ""
-                    LLMController.last_elapsed_ms = elapsed
-                    # print(f"[LLM] chat ✓ {elapsed:.0f}ms → {result!r}", flush=True)
-                elif item[0] == "summary":
-                    _, memory_text, _ = item
-                    result  = self._call_ollama_summary(memory_text)
-                    elapsed = (time.monotonic() - t0) * 1000
-                    print(f"[LLM] summary ✓ {elapsed:.0f}ms → {result!r}", flush=True)
-                else:
-                    result = None
-            except Exception as exc:
-                elapsed = (time.monotonic() - t0) * 1000
-                LLMController.total_errors   += 1
-                LLMController.last_error      = str(exc)
-                LLMController.last_elapsed_ms = elapsed
-                result = None
-                print(f"[LLM] ✗ {elapsed:.0f}ms — {exc}", flush=True)
-            self._res_q.put((cb, result))
+    def _on_chat_done(self, future: "concurrent.futures.Future", callback, t0: float):
+        """Called from a pool thread when a chat request finishes; enqueues result for main thread."""
+        elapsed = (time.monotonic() - t0) * 1000
+        try:
+            result = future.result()
+            if result:
+                result = "".join(ch for ch in result if ch in CHAT_EMOJIS) or None
+            LLMController.total_ok       += 1
+            LLMController.last_emoji      = (result or "")[:8]
+            LLMController.last_error      = ""
+            LLMController.last_elapsed_ms = elapsed
+        except Exception as exc:
+            LLMController.total_errors   += 1
+            LLMController.last_error      = str(exc)
+            LLMController.last_elapsed_ms = elapsed
+            result = None
+            print(f"[LLM] chat ✗ {elapsed:.0f}ms — {exc}", flush=True)
+        self._res_q.put((callback, result))
+
+    def _on_summary_done(self, future: "concurrent.futures.Future", callback):
+        """Called from a pool thread when a summary request finishes; enqueues result for main thread."""
+        try:
+            result = future.result()
+            print(f"[LLM] summary ✓ → {result!r}", flush=True)
+        except Exception as exc:
+            result = None
+            print(f"[LLM] summary ✗ — {exc}", flush=True)
+        self._res_q.put((callback, result))
 
     @staticmethod
     def _extract_favor(personality: str) -> str:
@@ -428,7 +443,7 @@ class LLMController:
             LLM_ENDPOINT, data=body,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
 
         return data["message"]["content"].strip() or None
@@ -447,7 +462,8 @@ class LLMController:
             "messages": [
                 {"role": "system",
                  "content": "You compress conversation histories into emoji sequences. "
-                             "Output ONLY emojis, no text, no spaces, max 100 characters."},
+                             "Output ONLY emojis, no text, no spaces, no non-alphanumeric characters, English only."
+                             "Max 100 characters."},
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
@@ -838,7 +854,8 @@ class Mascot(QWidget):
     _keep_alive:   bool           = False  # set True by launcher to prevent app quit
     _class_screen: "QRect | None" = None   # set by main(); launcher uses per-instance screen
     _valid_win:    "list | None"  = None   # populated each tick by _valid_windows()
-    _llm_enabled:  bool           = False  # enable ollama LLM for conversations
+    _llm_enabled:   bool          = False  # enable ollama LLM for conversations
+    _group_chat_on: bool          = False  # allow 3+ mascots in one conversation
 
     def __init__(
         self,
@@ -1225,7 +1242,7 @@ class Mascot(QWidget):
                     self._social_arrive(t)
                 else:
                     self._facing_right = dx > 0
-                    self._vx = (WALK_SPEED if self._facing_right else -WALK_SPEED) * 1.5
+                    self._vx = (WALK_SPEED if self._facing_right else -WALK_SPEED) * 2
                     self._ax += self._vx
                     self._anim.advance()
                     if not self._on_floor():
@@ -1233,7 +1250,10 @@ class Mascot(QWidget):
 
         elif self._state == State.CHATTING:
             if not self._on_floor() or self._conversation is None:
-                self._end_conversation()
+                if self._conversation is not None:
+                    self._conversation.abort()
+                else:
+                    self._end_conversation()
 
         elif self._state == State.FALL:
             self._vy = min(self._vy + GRAVITY, MAX_FALL_SPD)
@@ -1844,7 +1864,7 @@ class Mascot(QWidget):
             self._enter(State.FOLLOWING)
         elif roll < 0.55:
             # Start a conversation if close enough, otherwise approach first
-            if abs(target._ax - self._ax) < CHAT_DIST:
+            if abs(target._ax - self._ax) < CHAT_DIST and abs(target._ay - self._ay) < CHAT_DIST:
                 self._begin_chat(target)
             else:
                 self._social_target = target
@@ -1869,18 +1889,35 @@ class Mascot(QWidget):
             self._enter(State.IDLE)
 
     def _begin_chat(self, other: "Mascot"):
-        """Start a 3-5 turn emoji conversation with other."""
-        if other._state == State.CHATTING or self._conversation is not None:
+        """Start an emoji conversation.  If _group_chat_on, nearby idle mascots join too."""
+        if (other._state == State.CHATTING or other._conversation is not None
+                or self._conversation is not None):
             self._enter(State.IDLE)
             return
-        turns = random.randint(3, 5)
-        conv = Conversation(self, other, turns)
-        self._conversation = conv
-        other._conversation = conv
-        self._facing_right = other._ax > self._ax
-        other._facing_right = self._ax > other._ax
-        self._enter(State.CHATTING)
-        other._enter(State.CHATTING)
+
+        participants: list["Mascot"] = [self, other]
+
+        if Mascot._group_chat_on:
+            _ineligible = (State.DRAG, State.THROWN, State.CHATTING,
+                           State.MERGING, State.CLONING, State.FOLLOWING)
+            for m in Mascot._all:
+                if m is self or m is other:
+                    continue
+                if m._state in _ineligible or m._conversation is not None:
+                    continue
+                if abs(m._ax - self._ax) < CHAT_DIST and abs(m._ay - self._ay) < CHAT_DIST:
+                    participants.append(m)
+
+        n     = len(participants)
+        turns = random.randint(max(3, n), max(5, n * 2))
+        conv  = Conversation(participants, turns)
+
+        center_x = sum(m._ax for m in participants) / n
+        for m in participants:
+            m._conversation  = conv
+            m._facing_right  = center_x > m._ax
+            m._enter(State.CHATTING)
+        conv._do_turn()
 
     def _end_conversation(self):
         """Called by Conversation when it finishes, or if interrupted."""
@@ -2285,100 +2322,117 @@ class SpeechBubble(QWidget):
 
 class Conversation(QObject):
     """
-    Manages a 3-5 turn emoji exchange between two mascots.
-    Uses a single-shot QTimer to drive alternating turns.
-    When Mascot._llm_enabled, uses LLMController to generate emoji responses;
-    a "💭" thinking bubble is shown while the LLM processes.
-    Either mascot can call abort() to cancel early (e.g. on dismiss).
+    Manages an emoji exchange between 2 or more mascots.
+    Only one mascot speaks per turn; the next speaker is chosen randomly
+    from the non-current members so every participant gets a voice.
+    When Mascot._llm_enabled, uses LLMController to generate responses.
+    Any member can abort() the conversation early (e.g. on dismiss).
     """
 
-    def __init__(self, initiator: "Mascot", responder: "Mascot", total_turns: int):
+    BUBBLE_MAX_CHARS = 8   # hard clip on speech bubble content
+
+    def __init__(self, members: "list[Mascot]", total_turns: int):
         super().__init__()
-        self._a          = initiator
-        self._b          = responder
-        self._turns_left = total_turns
-        self._whose      = 0          # 0 = initiator's turn, 1 = responder's
-        self._aborted    = False
-        self._bubble: SpeechBubble | None = None
-        self._last_emoji: dict[int, str]  = {}   # id(mascot) → last emoji said
+        self._members:     list["Mascot"]      = list(members)
+        self._turns_left:  int                 = total_turns
+        self._speaker_idx: int                 = 0     # index into _members
+        self._prev_idx:    int                 = -1    # who spoke last (-1 = nobody yet)
+        self._aborted:     bool                = False
+        self._bubble:      "SpeechBubble | None" = None
+        self._last_emoji:  dict[int, str]      = {}    # id(mascot) → last emoji said
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._advance)
-        self._do_turn()
+
+    # ── Participant helpers ───────────────────────────────────────────────────
+
+    def _speaker(self) -> "Mascot":
+        return self._members[self._speaker_idx]
+
+    def _listeners(self) -> "list[Mascot]":
+        return [m for i, m in enumerate(self._members) if i != self._speaker_idx]
+
+    def _prev_speaker(self) -> "Mascot | None":
+        """The mascot who spoke last turn — used as LLM 'partner' context."""
+        return self._members[self._prev_idx] if self._prev_idx >= 0 else None
+
+    # ── Turn logic ────────────────────────────────────────────────────────────
 
     def _pick_emoji(self) -> str:
         return random.choice(CHAT_EMOJIS)
 
-    def _speaker(self) -> "Mascot":
-        return self._a if self._whose == 0 else self._b
-
-    def _listener(self) -> "Mascot":
-        return self._b if self._whose == 0 else self._a
-
     def _do_turn(self):
         if self._aborted:
             return
-        speaker  = self._speaker()
-        listener = self._listener()
-        if speaker not in Mascot._all:
+        speaker   = self._speaker()
+        listeners = self._listeners()
+        if speaker not in Mascot._all or speaker._conversation is not self:
             self.abort()
             return
 
-        if Mascot._llm_enabled:
+        # LLM context: respond to whoever spoke last, or the first listener
+        llm_partner = self._prev_speaker() or (listeners[0] if listeners else None)
+
+        if Mascot._llm_enabled and llm_partner:
             personality  = get_personality(speaker._sprites._dir)
             memory_text  = speaker._memory.to_text()
-            partner_name = listener._sprites._dir.name
-            partner_last = self._last_emoji.get(id(listener), "")
+            partner_name = llm_partner._sprites._dir.name
+            partner_last = self._last_emoji.get(id(llm_partner), "")
             LLMController.get().request(
                 personality, memory_text, partner_name, partner_last,
-                lambda emoji, sp=speaker, li=listener: self._on_llm_ready(emoji, sp, li),
+                lambda emoji, sp=speaker, li=listeners: self._on_llm_ready(emoji, sp, li),
             )
         else:
-            self._deliver(speaker, listener, self._pick_emoji(), source="random")
+            self._deliver(speaker, listeners, self._pick_emoji(), source="random")
 
-    # Maximum characters shown in a speech bubble (prevents overflow)
-    BUBBLE_MAX_CHARS = 8
-
-    def _on_llm_ready(self, emoji: str | None, speaker: "Mascot", listener: "Mascot"):
-        if self._aborted:
+    def _on_llm_ready(self, emoji: str | None, speaker: "Mascot",
+                      listeners: "list[Mascot]"):
+        if self._aborted or speaker._conversation is not self:
+            self.abort()
             return
         if emoji:
             emoji = emoji[:self.BUBBLE_MAX_CHARS]
-            self._deliver(speaker, listener, emoji, source="llm")
+            self._deliver(speaker, listeners, emoji, source="llm")
         else:
-            self._deliver(speaker, listener, self._pick_emoji(), source="random")
+            self._deliver(speaker, listeners, self._pick_emoji(), source="random")
 
-    def _deliver(self, speaker: "Mascot", listener: "Mascot", emoji: str, source: str = "random"):
-        """Show the speech bubble, record the turn in memories, log, and export training data."""
-        speaker_name  = speaker._sprites._dir.name
-        listener_name = listener._sprites._dir.name
-        partner_last  = self._last_emoji.get(id(listener), "")
+    def _deliver(self, speaker: "Mascot", listeners: "list[Mascot]",
+                 emoji: str, source: str = "random"):
+        """Show the speech bubble, update all memories, log, and export training data."""
+        speaker_name   = speaker._sprites._dir.name
+        listener_names = [m._sprites._dir.name for m in listeners]
+        llm_partner    = self._prev_speaker() or (listeners[0] if listeners else None)
+        partner_last   = self._last_emoji.get(id(llm_partner), "") if llm_partner else ""
 
-        # Export training record BEFORE recording this turn so memory reflects
-        # the state the model actually saw when it produced this response.
+        # Export BEFORE recording so the snapshot matches what the model saw
         _export_training_example(
-            speaker_name  = speaker_name,
-            listener_name = listener_name,
-            state         = speaker._state.name,
-            location      = _location_str(speaker),
-            memory        = speaker._memory,
-            partner_last  = partner_last,
-            emoji_output  = emoji,
-            source        = source,
+            speaker_name   = speaker_name,
+            listener_names = listener_names,
+            state          = speaker._state.name,
+            location       = _location_str(speaker),
+            memory         = speaker._memory,
+            partner_last   = partner_last,
+            emoji_output   = emoji,
+            source         = source,
         )
 
-        speaker._memory.record("said",            emoji)
-        speaker._memory.record("location",        _location_str(speaker))
-        listener._memory.record("heard",          emoji, speaker_name)
-        listener._memory.record("partner_action", speaker._state.name.lower())
+        # Update speaker memory
+        speaker._memory.record("said",     emoji)
+        speaker._memory.record("location", _location_str(speaker))
         self._last_emoji[id(speaker)] = emoji
 
-        # Trigger async LLM summarization after every SUMMARIZE_EVERY chat events
-        for m, name in ((speaker, speaker_name), (listener, listener_name)):
-            if m._memory.needs_summarization():
-                summarize_memory_async(name, m._memory)
+        # Update every listener's memory and face them toward the speaker
+        for li in listeners:
+            li._memory.record("heard",          emoji, speaker_name)
+            li._memory.record("partner_action", speaker._state.name.lower())
+            li._facing_right = speaker._ax > li._ax
 
-        _log_chat(speaker_name, listener_name, emoji, source)
+        # Trigger summarization if any participant is due
+        for m in [speaker] + listeners:
+            if m._memory.needs_summarization():
+                summarize_memory_async(m._sprites._dir.name, m._memory)
+
+        _log_chat(speaker_name, " & ".join(listener_names), emoji, source)
 
         if self._bubble and not self._bubble.isHidden():
             self._bubble.close()
@@ -2392,13 +2446,17 @@ class Conversation(QObject):
         if self._turns_left <= 0:
             self._finish()
         else:
-            self._whose ^= 1
+            # Randomly pick any other member as next speaker
+            self._prev_idx = self._speaker_idx
+            other_indices  = [i for i in range(len(self._members))
+                              if i != self._speaker_idx]
+            self._speaker_idx = random.choice(other_indices)
             self._do_turn()
 
     def _finish(self):
         self._aborted = True
         self._timer.stop()
-        for m in (self._a, self._b):
+        for m in self._members:
             if m in Mascot._all:
                 m._end_conversation()
 
@@ -2409,7 +2467,7 @@ class Conversation(QObject):
         self._timer.stop()
         if self._bubble and not self._bubble.isHidden():
             self._bubble.close()
-        for m in (self._a, self._b):
+        for m in self._members:
             if m in Mascot._all and m._conversation is self:
                 m._conversation = None
                 if m._state == State.CHATTING:
@@ -2517,7 +2575,7 @@ class DebugPanel(QWidget):
                     lines.append(f"               would-climb-side={side}  top={r.top()}")
                     lines.append(f"               left={r.left()}  right={r.right()}")
             
-            if m._social_target:
+            if m._social_target and m._social_target in Mascot._all :
                 lines.append(f"  social_target  #{Mascot._all.index(m._social_target) + 1} "
                              f"\"{m._social_target._sprites._dir}\" in state {m._social_target._state.name}")
             

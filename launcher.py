@@ -17,7 +17,7 @@ import subprocess
 import importlib.util
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize, QTimer, QPoint
+from PySide6.QtCore import Qt, QSize, QTimer, QPoint, QObject, Slot
 from PySide6.QtGui import QPixmap, QIcon, QFont
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
@@ -224,7 +224,8 @@ def load_settings() -> dict:
         "win_throw_on": False,
         "aware_same":   True,
         "aware_other":  False,
-        "llm_enabled":  False,
+        "llm_enabled":    False,
+        "group_chat_on":  False,
     }
     try:
         data = json.loads(SETTINGS_FILE.read_text())
@@ -286,6 +287,72 @@ class GroupDialog(QDialog):
         return [name for name, cb in self._checkboxes if cb.isChecked()]
 
 
+# ── Sleep / resume watcher ────────────────────────────────────────────────────
+
+class SleepWatcher(QObject):
+    """
+    Listens for the systemd PrepareForSleep D-Bus signal and gracefully
+    pauses all mascot timers + LLM polling before suspend, then restarts
+    them on resume.  Falls back silently if D-Bus is unavailable.
+    """
+
+    def __init__(self, mod, mascot_cls):
+        super().__init__()
+        self._mod    = mod
+        self._Mascot = mascot_cls
+        self._ok     = False
+
+        try:
+            from PySide6.QtDBus import QDBusConnection
+            bus = QDBusConnection.systemBus()
+            self._ok = bus.connect(
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "PrepareForSleep",
+                self._on_prepare_for_sleep,
+            )
+            state = "connected" if self._ok else "failed to connect"
+            print(f"[SLEEP] D-Bus sleep watcher {state}", flush=True)
+        except Exception as exc:
+            print(f"[SLEEP] D-Bus unavailable ({exc}), sleep handling disabled",
+                  flush=True)
+
+    @Slot(bool)
+    def _on_prepare_for_sleep(self, sleeping: bool):
+        if sleeping:
+            self._pause()
+        else:
+            self._resume()
+
+    def _pause(self):
+        print("[SLEEP] suspending — pausing all timers and saving memories",
+              flush=True)
+        for m in list(self._Mascot._all):
+            # Abort any active conversation so its timers are stopped cleanly
+            if m._conversation is not None:
+                m._conversation.abort()
+            m._timer.stop()
+            self._mod.save_memory(m._sprites._dir.name, m._memory)
+
+        # Stop the LLM result-poll timer so the background thread can't
+        # trigger Qt callbacks while the display connection is gone.
+        llm = self._mod.LLMController
+        if llm._instance is not None and llm._instance._poll.isActive():
+            llm._instance._poll.stop()
+
+    def _resume(self):
+        print("[SLEEP] resuming — restarting timers", flush=True)
+        for m in list(self._Mascot._all):
+            if not m._timer.isActive():
+                m._timer.start(self._mod.TICK_MS)
+
+        # Restart LLM polling
+        llm = self._mod.LLMController
+        if llm._instance is not None and not llm._instance._poll.isActive():
+            llm._instance._poll.start(100)
+
+
 # ── Launcher window ────────────────────────────────────────────────────────────
 
 class LauncherWindow(QWidget):
@@ -336,9 +403,13 @@ class LauncherWindow(QWidget):
         Mascot._win_throw_on = s["win_throw_on"]
         Mascot._aware_same   = s["aware_same"]
         Mascot._aware_other  = s["aware_other"]
-        Mascot._llm_enabled  = s["llm_enabled"]
+        Mascot._llm_enabled   = s["llm_enabled"]
+        Mascot._group_chat_on = s["group_chat_on"]
 
         self._setup_ui()
+
+        # Sleep/resume watcher — pauses mascots before suspend, restarts on wake
+        self._sleep_watcher = SleepWatcher(_mod, Mascot)
 
         # Refresh running-count display every 500 ms
         self._timer = QTimer(self)
@@ -398,12 +469,17 @@ class LauncherWindow(QWidget):
         self._act_llm.setCheckable(True)
         self._act_llm.setChecked(self._Mascot._llm_enabled)
         beh_menu.addAction(self._act_llm)
+        self._act_group_chat = QAction("Group Conversations", self)
+        self._act_group_chat.setCheckable(True)
+        self._act_group_chat.setChecked(self._Mascot._group_chat_on)
+        beh_menu.addAction(self._act_group_chat)
         self._act_debug.toggled.connect(self._toggle_debug)
         self._act_clone.toggled.connect(self._toggle_clone)
         self._act_throw.toggled.connect(self._toggle_throw)
         self._act_aware_same.toggled.connect(self._toggle_aware_same)
         self._act_aware_other.toggled.connect(self._toggle_aware_other)
         self._act_llm.toggled.connect(self._toggle_llm)
+        self._act_group_chat.toggled.connect(self._toggle_group_chat)
 
         # Groups menu
         self._groups_menu = menubar.addMenu("Groups")
@@ -594,6 +670,7 @@ class LauncherWindow(QWidget):
             (self._act_aware_same,  self._Mascot._aware_same),
             (self._act_aware_other, self._Mascot._aware_other),
             (self._act_llm,         self._Mascot._llm_enabled),
+            (self._act_group_chat,  self._Mascot._group_chat_on),
         ):
             act.blockSignals(True)
             act.setChecked(value)
@@ -715,13 +792,18 @@ class LauncherWindow(QWidget):
         self._Mascot._llm_enabled = checked
         self._save_settings()
 
+    def _toggle_group_chat(self, checked: bool):
+        self._Mascot._group_chat_on = checked
+        self._save_settings()
+
     def _save_settings(self):
         save_settings({
             "cloning_on":   self._Mascot._cloning_on,
             "win_throw_on": self._Mascot._win_throw_on,
             "aware_same":   self._Mascot._aware_same,
             "aware_other":  self._Mascot._aware_other,
-            "llm_enabled":  self._Mascot._llm_enabled,
+            "llm_enabled":   self._Mascot._llm_enabled,
+            "group_chat_on": self._Mascot._group_chat_on,
         })
 
     # ── Import helpers ────────────────────────────────────────────────────────

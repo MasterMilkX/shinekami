@@ -11,3 +11,6 @@ groups.json
 personalities/*
 logs/*
 memory/*
+send2nexus.sh
+memory*.zip
+__pycache__/*

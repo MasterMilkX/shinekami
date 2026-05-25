@@ -3,5 +3,6 @@
   "win_throw_on": true,
   "aware_same": false,
   "aware_other": true,
-  "llm_enabled": true
+  "llm_enabled": true,
+  "group_chat_on": true
 }
